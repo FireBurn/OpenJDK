@@ -1,0 +1,2763 @@
+From ea7b3a0357c662433d2de044014bb02e680232e8 Mon Sep 17 00:00:00 2001
+From: Mike Lothian <mike@fireburn.co.uk>
+Date: Wed, 21 Oct 2020 18:08:51 +0100
+Subject: [PATCH] Remove cgroups
+
+---
+ .../os/linux/cgroupSubsystem_linux.cpp        | 499 -------------
+ .../os/linux/cgroupSubsystem_linux.hpp        | 315 ---------
+ .../os/linux/cgroupV1Subsystem_linux.cpp      | 243 -------
+ .../os/linux/cgroupV1Subsystem_linux.hpp      | 118 ----
+ .../os/linux/cgroupV2Subsystem_linux.cpp      | 235 ------
+ .../os/linux/cgroupV2Subsystem_linux.hpp      |  89 ---
+ src/hotspot/os/linux/osContainer_linux.cpp    | 666 +++++++++++++++++-
+ src/hotspot/os/linux/osContainer_linux.hpp    |   3 +-
+ src/hotspot/os/linux/os_linux.hpp             |   3 +-
+ src/hotspot/share/prims/whitebox.cpp          |  41 --
+ src/hotspot/share/prims/whitebox.hpp          |   5 +-
+ .../cgroup/CgroupSubsystemFactory.java        | 253 -------
+ .../containers/docker/TestCPUAwareness.java   |  21 +-
+ test/lib/sun/hotspot/WhiteBox.java            |   3 -
+ 14 files changed, 639 insertions(+), 1855 deletions(-)
+ delete mode 100644 src/hotspot/os/linux/cgroupSubsystem_linux.cpp
+ delete mode 100644 src/hotspot/os/linux/cgroupSubsystem_linux.hpp
+ delete mode 100644 src/hotspot/os/linux/cgroupV1Subsystem_linux.cpp
+ delete mode 100644 src/hotspot/os/linux/cgroupV1Subsystem_linux.hpp
+ delete mode 100644 src/hotspot/os/linux/cgroupV2Subsystem_linux.cpp
+ delete mode 100644 src/hotspot/os/linux/cgroupV2Subsystem_linux.hpp
+ delete mode 100644 test/hotspot/jtreg/containers/cgroup/CgroupSubsystemFactory.java
+
+diff --git a/src/hotspot/os/linux/cgroupSubsystem_linux.cpp b/src/hotspot/os/linux/cgroupSubsystem_linux.cpp
+deleted file mode 100644
+index 990db778d..000000000
+--- a/src/hotspot/os/linux/cgroupSubsystem_linux.cpp
++++ /dev/null
+@@ -1,499 +0,0 @@
+-/*
+- * Copyright (c) 2019, 2020, Oracle and/or its affiliates. All rights reserved.
+- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+- *
+- * This code is free software; you can redistribute it and/or modify it
+- * under the terms of the GNU General Public License version 2 only, as
+- * published by the Free Software Foundation.
+- *
+- * This code is distributed in the hope that it will be useful, but WITHOUT
+- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+- * version 2 for more details (a copy is included in the LICENSE file that
+- * accompanied this code).
+- *
+- * You should have received a copy of the GNU General Public License version
+- * 2 along with this work; if not, write to the Free Software Foundation,
+- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+- *
+- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+- * or visit www.oracle.com if you need additional information or have any
+- * questions.
+- *
+- */
+-
+-#include <string.h>
+-#include <math.h>
+-#include <errno.h>
+-#include "cgroupSubsystem_linux.hpp"
+-#include "cgroupV1Subsystem_linux.hpp"
+-#include "cgroupV2Subsystem_linux.hpp"
+-#include "logging/log.hpp"
+-#include "memory/allocation.hpp"
+-#include "runtime/globals.hpp"
+-#include "runtime/os.hpp"
+-#include "utilities/globalDefinitions.hpp"
+-
+-CgroupSubsystem* CgroupSubsystemFactory::create() {
+-  CgroupV1MemoryController* memory = NULL;
+-  CgroupV1Controller* cpuset = NULL;
+-  CgroupV1Controller* cpu = NULL;
+-  CgroupV1Controller* cpuacct = NULL;
+-  CgroupInfo cg_infos[CG_INFO_LENGTH];
+-  u1 cg_type_flags = INVALID_CGROUPS_GENERIC;
+-  const char* proc_cgroups = "/proc/cgroups";
+-  const char* proc_self_cgroup = "/proc/self/cgroup";
+-  const char* proc_self_mountinfo = "/proc/self/mountinfo";
+-
+-  bool valid_cgroup = determine_type(cg_infos, proc_cgroups, proc_self_cgroup, proc_self_mountinfo, &cg_type_flags);
+-
+-  if (!valid_cgroup) {
+-    // Could not detect cgroup type
+-    return NULL;
+-  }
+-  assert(is_valid_cgroup(&cg_type_flags), "Expected valid cgroup type");
+-
+-  if (is_cgroup_v2(&cg_type_flags)) {
+-    // Cgroups v2 case, we have all the info we need.
+-    // Construct the subsystem, free resources and return
+-    // Note: any index in cg_infos will do as the path is the same for
+-    //       all controllers.
+-    CgroupController* unified = new CgroupV2Controller(cg_infos[MEMORY_IDX]._mount_path, cg_infos[MEMORY_IDX]._cgroup_path);
+-    log_debug(os, container)("Detected cgroups v2 unified hierarchy");
+-    cleanup(cg_infos);
+-    return new CgroupV2Subsystem(unified);
+-  }
+-
+-  /*
+-   * Cgroup v1 case:
+-   *
+-   * Use info gathered previously from /proc/self/cgroup
+-   * and map host mount point to
+-   * local one via /proc/self/mountinfo content above
+-   *
+-   * Docker example:
+-   * 5:memory:/docker/6558aed8fc662b194323ceab5b964f69cf36b3e8af877a14b80256e93aecb044
+-   *
+-   * Host example:
+-   * 5:memory:/user.slice
+-   *
+-   * Construct a path to the process specific memory and cpuset
+-   * cgroup directory.
+-   *
+-   * For a container running under Docker from memory example above
+-   * the paths would be:
+-   *
+-   * /sys/fs/cgroup/memory
+-   *
+-   * For a Host from memory example above the path would be:
+-   *
+-   * /sys/fs/cgroup/memory/user.slice
+-   *
+-   */
+-  assert(is_cgroup_v1(&cg_type_flags), "Cgroup v1 expected");
+-  for (int i = 0; i < CG_INFO_LENGTH; i++) {
+-    CgroupInfo info = cg_infos[i];
+-    if (strcmp(info._name, "memory") == 0) {
+-      memory = new CgroupV1MemoryController(info._root_mount_path, info._mount_path);
+-      memory->set_subsystem_path(info._cgroup_path);
+-    } else if (strcmp(info._name, "cpuset") == 0) {
+-      cpuset = new CgroupV1Controller(info._root_mount_path, info._mount_path);
+-      cpuset->set_subsystem_path(info._cgroup_path);
+-    } else if (strcmp(info._name, "cpu") == 0) {
+-      cpu = new CgroupV1Controller(info._root_mount_path, info._mount_path);
+-      cpu->set_subsystem_path(info._cgroup_path);
+-    } else if (strcmp(info._name, "cpuacct") == 0) {
+-      cpuacct = new CgroupV1Controller(info._root_mount_path, info._mount_path);
+-      cpuacct->set_subsystem_path(info._cgroup_path);
+-    }
+-  }
+-  cleanup(cg_infos);
+-  return new CgroupV1Subsystem(cpuset, cpu, cpuacct, memory);
+-}
+-
+-bool CgroupSubsystemFactory::determine_type(CgroupInfo* cg_infos,
+-                                            const char* proc_cgroups,
+-                                            const char* proc_self_cgroup,
+-                                            const char* proc_self_mountinfo,
+-                                            u1* flags) {
+-  FILE *mntinfo = NULL;
+-  FILE *cgroups = NULL;
+-  FILE *cgroup = NULL;
+-  char buf[MAXPATHLEN+1];
+-  char *p;
+-  bool is_cgroupsV2;
+-  // true iff all controllers, memory, cpu, cpuset, cpuacct are enabled
+-  // at the kernel level.
+-  bool all_controllers_enabled;
+-
+-  /*
+-   * Read /proc/cgroups so as to be able to distinguish cgroups v2 vs cgroups v1.
+-   *
+-   * For cgroups v1 hierarchy (hybrid or legacy), cpu, cpuacct, cpuset, memory controllers
+-   * must have non-zero for the hierarchy ID field and relevant controllers mounted.
+-   * Conversely, for cgroups v2 (unified hierarchy), cpu, cpuacct, cpuset, memory
+-   * controllers must have hierarchy ID 0 and the unified controller mounted.
+-   */
+-  cgroups = fopen(proc_cgroups, "r");
+-  if (cgroups == NULL) {
+-      log_debug(os, container)("Can't open %s, %s",
+-                               proc_cgroups, os::strerror(errno));
+-      *flags = INVALID_CGROUPS_GENERIC;
+-      return false;
+-  }
+-
+-  while ((p = fgets(buf, MAXPATHLEN, cgroups)) != NULL) {
+-    char name[MAXPATHLEN+1];
+-    int  hierarchy_id;
+-    int  enabled;
+-
+-    // Format of /proc/cgroups documented via man 7 cgroups
+-    if (sscanf(p, "%s %d %*d %d", name, &hierarchy_id, &enabled) != 3) {
+-      continue;
+-    }
+-    if (strcmp(name, "memory") == 0) {
+-      cg_infos[MEMORY_IDX]._name = os::strdup(name);
+-      cg_infos[MEMORY_IDX]._hierarchy_id = hierarchy_id;
+-      cg_infos[MEMORY_IDX]._enabled = (enabled == 1);
+-    } else if (strcmp(name, "cpuset") == 0) {
+-      cg_infos[CPUSET_IDX]._name = os::strdup(name);
+-      cg_infos[CPUSET_IDX]._hierarchy_id = hierarchy_id;
+-      cg_infos[CPUSET_IDX]._enabled = (enabled == 1);
+-    } else if (strcmp(name, "cpu") == 0) {
+-      cg_infos[CPU_IDX]._name = os::strdup(name);
+-      cg_infos[CPU_IDX]._hierarchy_id = hierarchy_id;
+-      cg_infos[CPU_IDX]._enabled = (enabled == 1);
+-    } else if (strcmp(name, "cpuacct") == 0) {
+-      cg_infos[CPUACCT_IDX]._name = os::strdup(name);
+-      cg_infos[CPUACCT_IDX]._hierarchy_id = hierarchy_id;
+-      cg_infos[CPUACCT_IDX]._enabled = (enabled == 1);
+-    }
+-  }
+-  fclose(cgroups);
+-
+-  is_cgroupsV2 = true;
+-  all_controllers_enabled = true;
+-  for (int i = 0; i < CG_INFO_LENGTH; i++) {
+-    is_cgroupsV2 = is_cgroupsV2 && cg_infos[i]._hierarchy_id == 0;
+-    all_controllers_enabled = all_controllers_enabled && cg_infos[i]._enabled;
+-  }
+-
+-  if (!all_controllers_enabled) {
+-    // one or more controllers disabled, disable container support
+-    log_debug(os, container)("One or more required controllers disabled at kernel level.");
+-    cleanup(cg_infos);
+-    *flags = INVALID_CGROUPS_GENERIC;
+-    return false;
+-  }
+-
+-  /*
+-   * Read /proc/self/cgroup and determine:
+-   *  - the cgroup path for cgroups v2 or
+-   *  - on a cgroups v1 system, collect info for mapping
+-   *    the host mount point to the local one via /proc/self/mountinfo below.
+-   */
+-  cgroup = fopen(proc_self_cgroup, "r");
+-  if (cgroup == NULL) {
+-    log_debug(os, container)("Can't open %s, %s",
+-                             proc_self_cgroup, os::strerror(errno));
+-    cleanup(cg_infos);
+-    *flags = INVALID_CGROUPS_GENERIC;
+-    return false;
+-  }
+-
+-  while ((p = fgets(buf, MAXPATHLEN, cgroup)) != NULL) {
+-    char *controllers;
+-    char *token;
+-    char *hierarchy_id_str;
+-    int  hierarchy_id;
+-    char *cgroup_path;
+-
+-    hierarchy_id_str = strsep(&p, ":");
+-    hierarchy_id = atoi(hierarchy_id_str);
+-    /* Get controllers and base */
+-    controllers = strsep(&p, ":");
+-    cgroup_path = strsep(&p, "\n");
+-
+-    if (controllers == NULL) {
+-      continue;
+-    }
+-
+-    while (!is_cgroupsV2 && (token = strsep(&controllers, ",")) != NULL) {
+-      if (strcmp(token, "memory") == 0) {
+-        assert(hierarchy_id == cg_infos[MEMORY_IDX]._hierarchy_id, "/proc/cgroups and /proc/self/cgroup hierarchy mismatch");
+-        cg_infos[MEMORY_IDX]._cgroup_path = os::strdup(cgroup_path);
+-      } else if (strcmp(token, "cpuset") == 0) {
+-        assert(hierarchy_id == cg_infos[CPUSET_IDX]._hierarchy_id, "/proc/cgroups and /proc/self/cgroup hierarchy mismatch");
+-        cg_infos[CPUSET_IDX]._cgroup_path = os::strdup(cgroup_path);
+-      } else if (strcmp(token, "cpu") == 0) {
+-        assert(hierarchy_id == cg_infos[CPU_IDX]._hierarchy_id, "/proc/cgroups and /proc/self/cgroup hierarchy mismatch");
+-        cg_infos[CPU_IDX]._cgroup_path = os::strdup(cgroup_path);
+-      } else if (strcmp(token, "cpuacct") == 0) {
+-        assert(hierarchy_id == cg_infos[CPUACCT_IDX]._hierarchy_id, "/proc/cgroups and /proc/self/cgroup hierarchy mismatch");
+-        cg_infos[CPUACCT_IDX]._cgroup_path = os::strdup(cgroup_path);
+-      }
+-    }
+-    if (is_cgroupsV2) {
+-      for (int i = 0; i < CG_INFO_LENGTH; i++) {
+-        cg_infos[i]._cgroup_path = os::strdup(cgroup_path);
+-      }
+-    }
+-  }
+-  fclose(cgroup);
+-
+-  // Find various mount points by reading /proc/self/mountinfo
+-  // mountinfo format is documented at https://www.kernel.org/doc/Documentation/filesystems/proc.txt
+-  mntinfo = fopen(proc_self_mountinfo, "r");
+-  if (mntinfo == NULL) {
+-      log_debug(os, container)("Can't open %s, %s",
+-                               proc_self_mountinfo, os::strerror(errno));
+-      cleanup(cg_infos);
+-      *flags = INVALID_CGROUPS_GENERIC;
+-      return false;
+-  }
+-
+-  bool cgroupv2_mount_point_found = false;
+-  bool any_cgroup_mounts_found = false;
+-  while ((p = fgets(buf, MAXPATHLEN, mntinfo)) != NULL) {
+-    char tmp_mount_point[MAXPATHLEN+1];
+-    char tmp_fs_type[MAXPATHLEN+1];
+-    char tmproot[MAXPATHLEN+1];
+-    char tmpmount[MAXPATHLEN+1];
+-    char tmpcgroups[MAXPATHLEN+1];
+-    char *cptr = tmpcgroups;
+-    char *token;
+-
+-    // Cgroup v2 relevant info. We only look for the _mount_path iff is_cgroupsV2 so
+-    // as to avoid memory stomping of the _mount_path pointer later on in the cgroup v1
+-    // block in the hybrid case.
+-    //
+-    if (is_cgroupsV2 && sscanf(p, "%*d %*d %*d:%*d %*s %s %*[^-]- %s cgroup2 %*s", tmp_mount_point, tmp_fs_type) == 2) {
+-      // we likely have an early match return (e.g. cgroup fs match), be sure we have cgroup2 as fstype
+-      if (!cgroupv2_mount_point_found && strcmp("cgroup2", tmp_fs_type) == 0) {
+-        cgroupv2_mount_point_found = true;
+-        any_cgroup_mounts_found = true;
+-        for (int i = 0; i < CG_INFO_LENGTH; i++) {
+-          assert(cg_infos[i]._mount_path == NULL, "_mount_path memory stomping");
+-          cg_infos[i]._mount_path = os::strdup(tmp_mount_point);
+-        }
+-      }
+-    }
+-
+-    /* Cgroup v1 relevant info
+-     *
+-     * Find the cgroup mount point for memory, cpuset, cpu, cpuacct
+-     *
+-     * Example for docker:
+-     * 219 214 0:29 /docker/7208cebd00fa5f2e342b1094f7bed87fa25661471a4637118e65f1c995be8a34 /sys/fs/cgroup/memory ro,nosuid,nodev,noexec,relatime - cgroup cgroup rw,memory
+-     *
+-     * Example for host:
+-     * 34 28 0:29 / /sys/fs/cgroup/memory rw,nosuid,nodev,noexec,relatime shared:16 - cgroup cgroup rw,memory
+-     */
+-    if (sscanf(p, "%*d %*d %*d:%*d %s %s %*[^-]- %s cgroup %s", tmproot, tmpmount, tmp_fs_type, tmpcgroups) == 4) {
+-      if (strcmp("cgroup", tmp_fs_type) != 0) {
+-        // Skip cgroup2 fs lines on hybrid or unified hierarchy.
+-        continue;
+-      }
+-      any_cgroup_mounts_found = true;
+-      while ((token = strsep(&cptr, ",")) != NULL) {
+-        if (strcmp(token, "memory") == 0) {
+-          assert(cg_infos[MEMORY_IDX]._mount_path == NULL, "stomping of _mount_path");
+-          cg_infos[MEMORY_IDX]._mount_path = os::strdup(tmpmount);
+-          cg_infos[MEMORY_IDX]._root_mount_path = os::strdup(tmproot);
+-          cg_infos[MEMORY_IDX]._data_complete = true;
+-        } else if (strcmp(token, "cpuset") == 0) {
+-          assert(cg_infos[CPUSET_IDX]._mount_path == NULL, "stomping of _mount_path");
+-          cg_infos[CPUSET_IDX]._mount_path = os::strdup(tmpmount);
+-          cg_infos[CPUSET_IDX]._root_mount_path = os::strdup(tmproot);
+-          cg_infos[CPUSET_IDX]._data_complete = true;
+-        } else if (strcmp(token, "cpu") == 0) {
+-          assert(cg_infos[CPU_IDX]._mount_path == NULL, "stomping of _mount_path");
+-          cg_infos[CPU_IDX]._mount_path = os::strdup(tmpmount);
+-          cg_infos[CPU_IDX]._root_mount_path = os::strdup(tmproot);
+-          cg_infos[CPU_IDX]._data_complete = true;
+-        } else if (strcmp(token, "cpuacct") == 0) {
+-          assert(cg_infos[CPUACCT_IDX]._mount_path == NULL, "stomping of _mount_path");
+-          cg_infos[CPUACCT_IDX]._mount_path = os::strdup(tmpmount);
+-          cg_infos[CPUACCT_IDX]._root_mount_path = os::strdup(tmproot);
+-          cg_infos[CPUACCT_IDX]._data_complete = true;
+-        }
+-      }
+-    }
+-  }
+-  fclose(mntinfo);
+-
+-  // Neither cgroup2 nor cgroup filesystems mounted via /proc/self/mountinfo
+-  // No point in continuing.
+-  if (!any_cgroup_mounts_found) {
+-    log_trace(os, container)("No cgroup controllers mounted.");
+-    cleanup(cg_infos);
+-    *flags = INVALID_CGROUPS_NO_MOUNT;
+-    return false;
+-  }
+-
+-  if (is_cgroupsV2) {
+-    if (!cgroupv2_mount_point_found) {
+-      log_trace(os, container)("Mount point for cgroupv2 not found in /proc/self/mountinfo");
+-      cleanup(cg_infos);
+-      *flags = INVALID_CGROUPS_V2;
+-      return false;
+-    }
+-    // Cgroups v2 case, we have all the info we need.
+-    *flags = CGROUPS_V2;
+-    return true;
+-  }
+-
+-  // What follows is cgroups v1
+-  log_debug(os, container)("Detected cgroups hybrid or legacy hierarchy, using cgroups v1 controllers");
+-
+-  if (!cg_infos[MEMORY_IDX]._data_complete) {
+-    log_debug(os, container)("Required cgroup v1 memory subsystem not found");
+-    cleanup(cg_infos);
+-    *flags = INVALID_CGROUPS_V1;
+-    return false;
+-  }
+-  if (!cg_infos[CPUSET_IDX]._data_complete) {
+-    log_debug(os, container)("Required cgroup v1 cpuset subsystem not found");
+-    cleanup(cg_infos);
+-    *flags = INVALID_CGROUPS_V1;
+-    return false;
+-  }
+-  if (!cg_infos[CPU_IDX]._data_complete) {
+-    log_debug(os, container)("Required cgroup v1 cpu subsystem not found");
+-    cleanup(cg_infos);
+-    *flags = INVALID_CGROUPS_V1;
+-    return false;
+-  }
+-  if (!cg_infos[CPUACCT_IDX]._data_complete) {
+-    log_debug(os, container)("Required cgroup v1 cpuacct subsystem not found");
+-    cleanup(cg_infos);
+-    *flags = INVALID_CGROUPS_V1;
+-    return false;
+-  }
+-  // Cgroups v1 case, we have all the info we need.
+-  *flags = CGROUPS_V1;
+-  return true;
+-
+-};
+-
+-void CgroupSubsystemFactory::cleanup(CgroupInfo* cg_infos) {
+-  assert(cg_infos != NULL, "Invariant");
+-  for (int i = 0; i < CG_INFO_LENGTH; i++) {
+-    os::free(cg_infos[i]._name);
+-    os::free(cg_infos[i]._cgroup_path);
+-    os::free(cg_infos[i]._root_mount_path);
+-    os::free(cg_infos[i]._mount_path);
+-  }
+-}
+-
+-/* active_processor_count
+- *
+- * Calculate an appropriate number of active processors for the
+- * VM to use based on these three inputs.
+- *
+- * cpu affinity
+- * cgroup cpu quota & cpu period
+- * cgroup cpu shares
+- *
+- * Algorithm:
+- *
+- * Determine the number of available CPUs from sched_getaffinity
+- *
+- * If user specified a quota (quota != -1), calculate the number of
+- * required CPUs by dividing quota by period.
+- *
+- * If shares are in effect (shares != -1), calculate the number
+- * of CPUs required for the shares by dividing the share value
+- * by PER_CPU_SHARES.
+- *
+- * All results of division are rounded up to the next whole number.
+- *
+- * If neither shares or quotas have been specified, return the
+- * number of active processors in the system.
+- *
+- * If both shares and quotas have been specified, the results are
+- * based on the flag PreferContainerQuotaForCPUCount.  If true,
+- * return the quota value.  If false return the smallest value
+- * between shares or quotas.
+- *
+- * If shares and/or quotas have been specified, the resulting number
+- * returned will never exceed the number of active processors.
+- *
+- * return:
+- *    number of CPUs
+- */
+-int CgroupSubsystem::active_processor_count() {
+-  int quota_count = 0, share_count = 0;
+-  int cpu_count, limit_count;
+-  int result;
+-
+-  // We use a cache with a timeout to avoid performing expensive
+-  // computations in the event this function is called frequently.
+-  // [See 8227006].
+-  CachingCgroupController* contrl = cpu_controller();
+-  CachedMetric* cpu_limit = contrl->metrics_cache();
+-  if (!cpu_limit->should_check_metric()) {
+-    int val = (int)cpu_limit->value();
+-    log_trace(os, container)("CgroupSubsystem::active_processor_count (cached): %d", val);
+-    return val;
+-  }
+-
+-  cpu_count = limit_count = os::Linux::active_processor_count();
+-  int quota  = cpu_quota();
+-  int period = cpu_period();
+-  int share  = cpu_shares();
+-
+-  if (quota > -1 && period > 0) {
+-    quota_count = ceilf((float)quota / (float)period);
+-    log_trace(os, container)("CPU Quota count based on quota/period: %d", quota_count);
+-  }
+-  if (share > -1) {
+-    share_count = ceilf((float)share / (float)PER_CPU_SHARES);
+-    log_trace(os, container)("CPU Share count based on shares: %d", share_count);
+-  }
+-
+-  // If both shares and quotas are setup results depend
+-  // on flag PreferContainerQuotaForCPUCount.
+-  // If true, limit CPU count to quota
+-  // If false, use minimum of shares and quotas
+-  if (quota_count !=0 && share_count != 0) {
+-    if (PreferContainerQuotaForCPUCount) {
+-      limit_count = quota_count;
+-    } else {
+-      limit_count = MIN2(quota_count, share_count);
+-    }
+-  } else if (quota_count != 0) {
+-    limit_count = quota_count;
+-  } else if (share_count != 0) {
+-    limit_count = share_count;
+-  }
+-
+-  result = MIN2(cpu_count, limit_count);
+-  log_trace(os, container)("OSContainer::active_processor_count: %d", result);
+-
+-  // Update cached metric to avoid re-reading container settings too often
+-  cpu_limit->set_value(result, OSCONTAINER_CACHE_TIMEOUT);
+-
+-  return result;
+-}
+-
+-/* memory_limit_in_bytes
+- *
+- * Return the limit of available memory for this process.
+- *
+- * return:
+- *    memory limit in bytes or
+- *    -1 for unlimited
+- *    OSCONTAINER_ERROR for not supported
+- */
+-jlong CgroupSubsystem::memory_limit_in_bytes() {
+-  CachingCgroupController* contrl = memory_controller();
+-  CachedMetric* memory_limit = contrl->metrics_cache();
+-  if (!memory_limit->should_check_metric()) {
+-    return memory_limit->value();
+-  }
+-  jlong mem_limit = read_memory_limit_in_bytes();
+-  // Update cached metric to avoid re-reading container settings too often
+-  memory_limit->set_value(mem_limit, OSCONTAINER_CACHE_TIMEOUT);
+-  return mem_limit;
+-}
+diff --git a/src/hotspot/os/linux/cgroupSubsystem_linux.hpp b/src/hotspot/os/linux/cgroupSubsystem_linux.hpp
+deleted file mode 100644
+index 80c147c75..000000000
+--- a/src/hotspot/os/linux/cgroupSubsystem_linux.hpp
++++ /dev/null
+@@ -1,315 +0,0 @@
+-/*
+- * Copyright (c) 2019, 2020, Oracle and/or its affiliates. All rights reserved.
+- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+- *
+- * This code is free software; you can redistribute it and/or modify it
+- * under the terms of the GNU General Public License version 2 only, as
+- * published by the Free Software Foundation.
+- *
+- * This code is distributed in the hope that it will be useful, but WITHOUT
+- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+- * version 2 for more details (a copy is included in the LICENSE file that
+- * accompanied this code).
+- *
+- * You should have received a copy of the GNU General Public License version
+- * 2 along with this work; if not, write to the Free Software Foundation,
+- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+- *
+- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+- * or visit www.oracle.com if you need additional information or have any
+- * questions.
+- *
+- */
+-
+-#ifndef CGROUP_SUBSYSTEM_LINUX_HPP
+-#define CGROUP_SUBSYSTEM_LINUX_HPP
+-
+-#include "memory/allocation.hpp"
+-#include "runtime/os.hpp"
+-#include "logging/log.hpp"
+-#include "utilities/globalDefinitions.hpp"
+-#include "utilities/macros.hpp"
+-#include "osContainer_linux.hpp"
+-
+-// Shared cgroups code (used by cgroup version 1 and version 2)
+-
+-/*
+- * PER_CPU_SHARES has been set to 1024 because CPU shares' quota
+- * is commonly used in cloud frameworks like Kubernetes[1],
+- * AWS[2] and Mesos[3] in a similar way. They spawn containers with
+- * --cpu-shares option values scaled by PER_CPU_SHARES. Thus, we do
+- * the inverse for determining the number of possible available
+- * CPUs to the JVM inside a container. See JDK-8216366.
+- *
+- * [1] https://kubernetes.io/docs/concepts/configuration/manage-compute-resources-container/#meaning-of-cpu
+- *     In particular:
+- *        When using Docker:
+- *          The spec.containers[].resources.requests.cpu is converted to its core value, which is potentially
+- *          fractional, and multiplied by 1024. The greater of this number or 2 is used as the value of the
+- *          --cpu-shares flag in the docker run command.
+- * [2] https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_ContainerDefinition.html
+- * [3] https://github.com/apache/mesos/blob/3478e344fb77d931f6122980c6e94cd3913c441d/src/docker/docker.cpp#L648
+- *     https://github.com/apache/mesos/blob/3478e344fb77d931f6122980c6e94cd3913c441d/src/slave/containerizer/mesos/isolators/cgroups/constants.hpp#L30
+- */
+-#define PER_CPU_SHARES 1024
+-
+-#define CGROUPS_V1               1
+-#define CGROUPS_V2               2
+-#define INVALID_CGROUPS_V2       3
+-#define INVALID_CGROUPS_V1       4
+-#define INVALID_CGROUPS_NO_MOUNT 5
+-#define INVALID_CGROUPS_GENERIC  6
+-
+-// Four controllers: cpu, cpuset, cpuacct, memory
+-#define CG_INFO_LENGTH 4
+-#define CPUSET_IDX     0
+-#define CPU_IDX        1
+-#define CPUACCT_IDX    2
+-#define MEMORY_IDX     3
+-
+-typedef char * cptr;
+-
+-class CgroupController: public CHeapObj<mtInternal> {
+-  public:
+-    virtual char *subsystem_path() = 0;
+-};
+-
+-PRAGMA_DIAG_PUSH
+-PRAGMA_FORMAT_NONLITERAL_IGNORED
+-template <typename T> int subsystem_file_line_contents(CgroupController* c,
+-                                              const char *filename,
+-                                              const char *matchline,
+-                                              const char *scan_fmt,
+-                                              T returnval) {
+-  FILE *fp = NULL;
+-  char *p;
+-  char file[MAXPATHLEN+1];
+-  char buf[MAXPATHLEN+1];
+-  char discard[MAXPATHLEN+1];
+-  bool found_match = false;
+-
+-  if (c == NULL) {
+-    log_debug(os, container)("subsystem_file_line_contents: CgroupController* is NULL");
+-    return OSCONTAINER_ERROR;
+-  }
+-  if (c->subsystem_path() == NULL) {
+-    log_debug(os, container)("subsystem_file_line_contents: subsystem path is NULL");
+-    return OSCONTAINER_ERROR;
+-  }
+-
+-  strncpy(file, c->subsystem_path(), MAXPATHLEN);
+-  file[MAXPATHLEN-1] = '\0';
+-  int filelen = strlen(file);
+-  if ((filelen + strlen(filename)) > (MAXPATHLEN-1)) {
+-    log_debug(os, container)("File path too long %s, %s", file, filename);
+-    return OSCONTAINER_ERROR;
+-  }
+-  strncat(file, filename, MAXPATHLEN-filelen);
+-  log_trace(os, container)("Path to %s is %s", filename, file);
+-  fp = fopen(file, "r");
+-  if (fp != NULL) {
+-    int err = 0;
+-    while ((p = fgets(buf, MAXPATHLEN, fp)) != NULL) {
+-      found_match = false;
+-      if (matchline == NULL) {
+-        // single-line file case
+-        int matched = sscanf(p, scan_fmt, returnval);
+-        found_match = (matched == 1);
+-      } else {
+-        // multi-line file case
+-        if (strstr(p, matchline) != NULL) {
+-          // discard matchline string prefix
+-          int matched = sscanf(p, scan_fmt, discard, returnval);
+-          found_match = (matched == 2);
+-        } else {
+-          continue; // substring not found
+-        }
+-      }
+-      if (found_match) {
+-        fclose(fp);
+-        return 0;
+-      } else {
+-        err = 1;
+-        log_debug(os, container)("Type %s not found in file %s", scan_fmt, file);
+-      }
+-    }
+-    if (err == 0) {
+-      log_debug(os, container)("Empty file %s", file);
+-    }
+-  } else {
+-    log_debug(os, container)("Open of file %s failed, %s", file, os::strerror(errno));
+-  }
+-  if (fp != NULL)
+-    fclose(fp);
+-  return OSCONTAINER_ERROR;
+-}
+-PRAGMA_DIAG_POP
+-
+-#define GET_CONTAINER_INFO(return_type, subsystem, filename,              \
+-                           logstring, scan_fmt, variable)                 \
+-  return_type variable;                                                   \
+-{                                                                         \
+-  int err;                                                                \
+-  err = subsystem_file_line_contents(subsystem,                           \
+-                                     filename,                            \
+-                                     NULL,                                \
+-                                     scan_fmt,                            \
+-                                     &variable);                          \
+-  if (err != 0)                                                           \
+-    return (return_type) OSCONTAINER_ERROR;                               \
+-                                                                          \
+-  log_trace(os, container)(logstring, variable);                          \
+-}
+-
+-#define GET_CONTAINER_INFO_CPTR(return_type, subsystem, filename,         \
+-                               logstring, scan_fmt, variable, bufsize)    \
+-  char variable[bufsize];                                                 \
+-{                                                                         \
+-  int err;                                                                \
+-  err = subsystem_file_line_contents(subsystem,                           \
+-                                     filename,                            \
+-                                     NULL,                                \
+-                                     scan_fmt,                            \
+-                                     variable);                           \
+-  if (err != 0)                                                           \
+-    return (return_type) NULL;                                            \
+-                                                                          \
+-  log_trace(os, container)(logstring, variable);                          \
+-}
+-
+-#define GET_CONTAINER_INFO_LINE(return_type, controller, filename,        \
+-                           matchline, logstring, scan_fmt, variable)      \
+-  return_type variable;                                                   \
+-{                                                                         \
+-  int err;                                                                \
+-  err = subsystem_file_line_contents(controller,                          \
+-                                filename,                                 \
+-                                matchline,                                \
+-                                scan_fmt,                                 \
+-                                &variable);                               \
+-  if (err != 0)                                                           \
+-    return (return_type) OSCONTAINER_ERROR;                               \
+-                                                                          \
+-  log_trace(os, container)(logstring, variable);                          \
+-}
+-
+-
+-class CachedMetric : public CHeapObj<mtInternal>{
+-  private:
+-    volatile jlong _metric;
+-    volatile jlong _next_check_counter;
+-  public:
+-    CachedMetric() {
+-      _metric = -1;
+-      _next_check_counter = min_jlong;
+-    }
+-    bool should_check_metric() {
+-      return os::elapsed_counter() > _next_check_counter;
+-    }
+-    jlong value() { return _metric; }
+-    void set_value(jlong value, jlong timeout) {
+-      _metric = value;
+-      // Metric is unlikely to change, but we want to remain
+-      // responsive to configuration changes. A very short grace time
+-      // between re-read avoids excessive overhead during startup without
+-      // significantly reducing the VMs ability to promptly react to changed
+-      // metric config
+-      _next_check_counter = os::elapsed_counter() + timeout;
+-    }
+-};
+-
+-class CachingCgroupController : public CHeapObj<mtInternal> {
+-  private:
+-    CgroupController* _controller;
+-    CachedMetric* _metrics_cache;
+-
+-  public:
+-    CachingCgroupController(CgroupController* cont) {
+-      _controller = cont;
+-      _metrics_cache = new CachedMetric();
+-    }
+-
+-    CachedMetric* metrics_cache() { return _metrics_cache; }
+-    CgroupController* controller() { return _controller; }
+-};
+-
+-class CgroupSubsystem: public CHeapObj<mtInternal> {
+-  public:
+-    jlong memory_limit_in_bytes();
+-    int active_processor_count();
+-
+-    virtual int cpu_quota() = 0;
+-    virtual int cpu_period() = 0;
+-    virtual int cpu_shares() = 0;
+-    virtual jlong memory_usage_in_bytes() = 0;
+-    virtual jlong memory_and_swap_limit_in_bytes() = 0;
+-    virtual jlong memory_soft_limit_in_bytes() = 0;
+-    virtual jlong memory_max_usage_in_bytes() = 0;
+-    virtual char * cpu_cpuset_cpus() = 0;
+-    virtual char * cpu_cpuset_memory_nodes() = 0;
+-    virtual jlong read_memory_limit_in_bytes() = 0;
+-    virtual const char * container_type() = 0;
+-    virtual CachingCgroupController* memory_controller() = 0;
+-    virtual CachingCgroupController* cpu_controller() = 0;
+-};
+-
+-// Utility class for storing info retrieved from /proc/cgroups,
+-// /proc/self/cgroup and /proc/self/mountinfo
+-// For reference see man 7 cgroups and CgroupSubsystemFactory
+-class CgroupInfo : public StackObj {
+-  friend class CgroupSubsystemFactory;
+-  friend class WhiteBox;
+-
+-  private:
+-    char* _name;
+-    int _hierarchy_id;
+-    bool _enabled;
+-    bool _data_complete;    // indicating cgroup v1 data is complete for this controller
+-    char* _cgroup_path;     // cgroup controller path from /proc/self/cgroup
+-    char* _root_mount_path; // root mount path from /proc/self/mountinfo. Unused for cgroup v2
+-    char* _mount_path;      // mount path from /proc/self/mountinfo.
+-
+-  public:
+-    CgroupInfo() {
+-      _name = NULL;
+-      _hierarchy_id = -1;
+-      _enabled = false;
+-      _data_complete = false;
+-      _cgroup_path = NULL;
+-      _root_mount_path = NULL;
+-      _mount_path = NULL;
+-    }
+-
+-};
+-
+-class CgroupSubsystemFactory: AllStatic {
+-  friend class WhiteBox;
+-
+-  public:
+-    static CgroupSubsystem* create();
+-  private:
+-    static inline bool is_cgroup_v2(u1* flags) {
+-       return *flags == CGROUPS_V2;
+-    }
+-
+-#ifdef ASSERT
+-    static inline bool is_valid_cgroup(u1* flags) {
+-       return *flags == CGROUPS_V1 || *flags == CGROUPS_V2;
+-    }
+-    static inline bool is_cgroup_v1(u1* flags) {
+-       return *flags == CGROUPS_V1;
+-    }
+-#endif
+-
+-    // Determine the cgroup type (version 1 or version 2), given
+-    // relevant paths to files. Sets 'flags' accordingly.
+-    static bool determine_type(CgroupInfo* cg_infos,
+-                               const char* proc_cgroups,
+-                               const char* proc_self_cgroup,
+-                               const char* proc_self_mountinfo,
+-                               u1* flags);
+-    static void cleanup(CgroupInfo* cg_infos);
+-};
+-
+-#endif // CGROUP_SUBSYSTEM_LINUX_HPP
+diff --git a/src/hotspot/os/linux/cgroupV1Subsystem_linux.cpp b/src/hotspot/os/linux/cgroupV1Subsystem_linux.cpp
+deleted file mode 100644
+index 5fdc2a9ab..000000000
+--- a/src/hotspot/os/linux/cgroupV1Subsystem_linux.cpp
++++ /dev/null
+@@ -1,243 +0,0 @@
+-/*
+- * Copyright (c) 2019, 2020, Oracle and/or its affiliates. All rights reserved.
+- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+- *
+- * This code is free software; you can redistribute it and/or modify it
+- * under the terms of the GNU General Public License version 2 only, as
+- * published by the Free Software Foundation.
+- *
+- * This code is distributed in the hope that it will be useful, but WITHOUT
+- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+- * version 2 for more details (a copy is included in the LICENSE file that
+- * accompanied this code).
+- *
+- * You should have received a copy of the GNU General Public License version
+- * 2 along with this work; if not, write to the Free Software Foundation,
+- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+- *
+- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+- * or visit www.oracle.com if you need additional information or have any
+- * questions.
+- *
+- */
+-
+-#include <string.h>
+-#include <math.h>
+-#include <errno.h>
+-#include "cgroupV1Subsystem_linux.hpp"
+-#include "logging/log.hpp"
+-#include "memory/allocation.hpp"
+-#include "runtime/globals.hpp"
+-#include "runtime/os.hpp"
+-#include "utilities/globalDefinitions.hpp"
+-
+-/*
+- * Set directory to subsystem specific files based
+- * on the contents of the mountinfo and cgroup files.
+- */
+-void CgroupV1Controller::set_subsystem_path(char *cgroup_path) {
+-  char buf[MAXPATHLEN+1];
+-  if (_root != NULL && cgroup_path != NULL) {
+-    if (strcmp(_root, "/") == 0) {
+-      int buflen;
+-      strncpy(buf, _mount_point, MAXPATHLEN);
+-      buf[MAXPATHLEN-1] = '\0';
+-      if (strcmp(cgroup_path,"/") != 0) {
+-        buflen = strlen(buf);
+-        if ((buflen + strlen(cgroup_path)) > (MAXPATHLEN-1)) {
+-          return;
+-        }
+-        strncat(buf, cgroup_path, MAXPATHLEN-buflen);
+-        buf[MAXPATHLEN-1] = '\0';
+-      }
+-      _path = os::strdup(buf);
+-    } else {
+-      if (strcmp(_root, cgroup_path) == 0) {
+-        strncpy(buf, _mount_point, MAXPATHLEN);
+-        buf[MAXPATHLEN-1] = '\0';
+-        _path = os::strdup(buf);
+-      } else {
+-        char *p = strstr(cgroup_path, _root);
+-        if (p != NULL && p == _root) {
+-          if (strlen(cgroup_path) > strlen(_root)) {
+-            int buflen;
+-            strncpy(buf, _mount_point, MAXPATHLEN);
+-            buf[MAXPATHLEN-1] = '\0';
+-            buflen = strlen(buf);
+-            if ((buflen + strlen(cgroup_path) - strlen(_root)) > (MAXPATHLEN-1)) {
+-              return;
+-            }
+-            strncat(buf, cgroup_path + strlen(_root), MAXPATHLEN-buflen);
+-            buf[MAXPATHLEN-1] = '\0';
+-            _path = os::strdup(buf);
+-          }
+-        }
+-      }
+-    }
+-  }
+-}
+-
+-/* uses_mem_hierarchy
+- *
+- * Return whether or not hierarchical cgroup accounting is being
+- * done.
+- *
+- * return:
+- *    A number > 0 if true, or
+- *    OSCONTAINER_ERROR for not supported
+- */
+-jlong CgroupV1MemoryController::uses_mem_hierarchy() {
+-  GET_CONTAINER_INFO(jlong, this, "/memory.use_hierarchy",
+-                    "Use Hierarchy is: " JLONG_FORMAT, JLONG_FORMAT, use_hierarchy);
+-  return use_hierarchy;
+-}
+-
+-void CgroupV1MemoryController::set_subsystem_path(char *cgroup_path) {
+-  CgroupV1Controller::set_subsystem_path(cgroup_path);
+-  jlong hierarchy = uses_mem_hierarchy();
+-  if (hierarchy > 0) {
+-    set_hierarchical(true);
+-  }
+-}
+-
+-jlong CgroupV1Subsystem::read_memory_limit_in_bytes() {
+-  GET_CONTAINER_INFO(julong, _memory->controller(), "/memory.limit_in_bytes",
+-                     "Memory Limit is: " JULONG_FORMAT, JULONG_FORMAT, memlimit);
+-
+-  if (memlimit >= _unlimited_memory) {
+-    log_trace(os, container)("Non-Hierarchical Memory Limit is: Unlimited");
+-    CgroupV1MemoryController* mem_controller = reinterpret_cast<CgroupV1MemoryController*>(_memory->controller());
+-    if (mem_controller->is_hierarchical()) {
+-      const char* matchline = "hierarchical_memory_limit";
+-      const char* format = "%s " JULONG_FORMAT;
+-      GET_CONTAINER_INFO_LINE(julong, _memory->controller(), "/memory.stat", matchline,
+-                             "Hierarchical Memory Limit is: " JULONG_FORMAT, format, hier_memlimit)
+-      if (hier_memlimit >= _unlimited_memory) {
+-        log_trace(os, container)("Hierarchical Memory Limit is: Unlimited");
+-      } else {
+-        return (jlong)hier_memlimit;
+-      }
+-    }
+-    return (jlong)-1;
+-  }
+-  else {
+-    return (jlong)memlimit;
+-  }
+-}
+-
+-jlong CgroupV1Subsystem::memory_and_swap_limit_in_bytes() {
+-  GET_CONTAINER_INFO(julong, _memory->controller(), "/memory.memsw.limit_in_bytes",
+-                     "Memory and Swap Limit is: " JULONG_FORMAT, JULONG_FORMAT, memswlimit);
+-  if (memswlimit >= _unlimited_memory) {
+-    log_trace(os, container)("Non-Hierarchical Memory and Swap Limit is: Unlimited");
+-    CgroupV1MemoryController* mem_controller = reinterpret_cast<CgroupV1MemoryController*>(_memory->controller());
+-    if (mem_controller->is_hierarchical()) {
+-      const char* matchline = "hierarchical_memsw_limit";
+-      const char* format = "%s " JULONG_FORMAT;
+-      GET_CONTAINER_INFO_LINE(julong, _memory->controller(), "/memory.stat", matchline,
+-                             "Hierarchical Memory and Swap Limit is : " JULONG_FORMAT, format, hier_memlimit)
+-      if (hier_memlimit >= _unlimited_memory) {
+-        log_trace(os, container)("Hierarchical Memory and Swap Limit is: Unlimited");
+-      } else {
+-        return (jlong)hier_memlimit;
+-      }
+-    }
+-    return (jlong)-1;
+-  } else {
+-    return (jlong)memswlimit;
+-  }
+-}
+-
+-jlong CgroupV1Subsystem::memory_soft_limit_in_bytes() {
+-  GET_CONTAINER_INFO(julong, _memory->controller(), "/memory.soft_limit_in_bytes",
+-                     "Memory Soft Limit is: " JULONG_FORMAT, JULONG_FORMAT, memsoftlimit);
+-  if (memsoftlimit >= _unlimited_memory) {
+-    log_trace(os, container)("Memory Soft Limit is: Unlimited");
+-    return (jlong)-1;
+-  } else {
+-    return (jlong)memsoftlimit;
+-  }
+-}
+-
+-/* memory_usage_in_bytes
+- *
+- * Return the amount of used memory for this process.
+- *
+- * return:
+- *    memory usage in bytes or
+- *    -1 for unlimited
+- *    OSCONTAINER_ERROR for not supported
+- */
+-jlong CgroupV1Subsystem::memory_usage_in_bytes() {
+-  GET_CONTAINER_INFO(jlong, _memory->controller(), "/memory.usage_in_bytes",
+-                     "Memory Usage is: " JLONG_FORMAT, JLONG_FORMAT, memusage);
+-  return memusage;
+-}
+-
+-/* memory_max_usage_in_bytes
+- *
+- * Return the maximum amount of used memory for this process.
+- *
+- * return:
+- *    max memory usage in bytes or
+- *    OSCONTAINER_ERROR for not supported
+- */
+-jlong CgroupV1Subsystem::memory_max_usage_in_bytes() {
+-  GET_CONTAINER_INFO(jlong, _memory->controller(), "/memory.max_usage_in_bytes",
+-                     "Maximum Memory Usage is: " JLONG_FORMAT, JLONG_FORMAT, memmaxusage);
+-  return memmaxusage;
+-}
+-
+-char * CgroupV1Subsystem::cpu_cpuset_cpus() {
+-  GET_CONTAINER_INFO_CPTR(cptr, _cpuset, "/cpuset.cpus",
+-                     "cpuset.cpus is: %s", "%1023s", cpus, 1024);
+-  return os::strdup(cpus);
+-}
+-
+-char * CgroupV1Subsystem::cpu_cpuset_memory_nodes() {
+-  GET_CONTAINER_INFO_CPTR(cptr, _cpuset, "/cpuset.mems",
+-                     "cpuset.mems is: %s", "%1023s", mems, 1024);
+-  return os::strdup(mems);
+-}
+-
+-/* cpu_quota
+- *
+- * Return the number of milliseconds per period
+- * process is guaranteed to run.
+- *
+- * return:
+- *    quota time in milliseconds
+- *    -1 for no quota
+- *    OSCONTAINER_ERROR for not supported
+- */
+-int CgroupV1Subsystem::cpu_quota() {
+-  GET_CONTAINER_INFO(int, _cpu->controller(), "/cpu.cfs_quota_us",
+-                     "CPU Quota is: %d", "%d", quota);
+-  return quota;
+-}
+-
+-int CgroupV1Subsystem::cpu_period() {
+-  GET_CONTAINER_INFO(int, _cpu->controller(), "/cpu.cfs_period_us",
+-                     "CPU Period is: %d", "%d", period);
+-  return period;
+-}
+-
+-/* cpu_shares
+- *
+- * Return the amount of cpu shares available to the process
+- *
+- * return:
+- *    Share number (typically a number relative to 1024)
+- *                 (2048 typically expresses 2 CPUs worth of processing)
+- *    -1 for no share setup
+- *    OSCONTAINER_ERROR for not supported
+- */
+-int CgroupV1Subsystem::cpu_shares() {
+-  GET_CONTAINER_INFO(int, _cpu->controller(), "/cpu.shares",
+-                     "CPU Shares is: %d", "%d", shares);
+-  // Convert 1024 to no shares setup
+-  if (shares == 1024) return -1;
+-
+-  return shares;
+-}
+diff --git a/src/hotspot/os/linux/cgroupV1Subsystem_linux.hpp b/src/hotspot/os/linux/cgroupV1Subsystem_linux.hpp
+deleted file mode 100644
+index 79a247a45..000000000
+--- a/src/hotspot/os/linux/cgroupV1Subsystem_linux.hpp
++++ /dev/null
+@@ -1,118 +0,0 @@
+-/*
+- * Copyright (c) 2019, 2020, Oracle and/or its affiliates. All rights reserved.
+- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+- *
+- * This code is free software; you can redistribute it and/or modify it
+- * under the terms of the GNU General Public License version 2 only, as
+- * published by the Free Software Foundation.
+- *
+- * This code is distributed in the hope that it will be useful, but WITHOUT
+- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+- * version 2 for more details (a copy is included in the LICENSE file that
+- * accompanied this code).
+- *
+- * You should have received a copy of the GNU General Public License version
+- * 2 along with this work; if not, write to the Free Software Foundation,
+- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+- *
+- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+- * or visit www.oracle.com if you need additional information or have any
+- * questions.
+- *
+- */
+-
+-#ifndef CGROUP_V1_SUBSYSTEM_LINUX_HPP
+-#define CGROUP_V1_SUBSYSTEM_LINUX_HPP
+-
+-#include "runtime/os.hpp"
+-#include "memory/allocation.hpp"
+-#include "cgroupSubsystem_linux.hpp"
+-
+-// Cgroups version 1 specific implementation
+-
+-class CgroupV1Controller: public CgroupController {
+-  private:
+-    /* mountinfo contents */
+-    char *_root;
+-    char *_mount_point;
+-
+-    /* Constructed subsystem directory */
+-    char *_path;
+-
+-  public:
+-    CgroupV1Controller(char *root, char *mountpoint) {
+-      _root = os::strdup(root);
+-      _mount_point = os::strdup(mountpoint);
+-      _path = NULL;
+-    }
+-
+-    virtual void set_subsystem_path(char *cgroup_path);
+-    char *subsystem_path() { return _path; }
+-};
+-
+-class CgroupV1MemoryController: public CgroupV1Controller {
+-
+-  public:
+-    bool is_hierarchical() { return _uses_mem_hierarchy; }
+-    void set_subsystem_path(char *cgroup_path);
+-  private:
+-    /* Some container runtimes set limits via cgroup
+-     * hierarchy. If set to true consider also memory.stat
+-     * file if everything else seems unlimited */
+-    bool _uses_mem_hierarchy;
+-    jlong uses_mem_hierarchy();
+-    void set_hierarchical(bool value) { _uses_mem_hierarchy = value; }
+-
+-  public:
+-    CgroupV1MemoryController(char *root, char *mountpoint) : CgroupV1Controller(root, mountpoint) {
+-      _uses_mem_hierarchy = false;
+-    }
+-
+-};
+-
+-class CgroupV1Subsystem: public CgroupSubsystem {
+-
+-  public:
+-    jlong read_memory_limit_in_bytes();
+-    jlong memory_and_swap_limit_in_bytes();
+-    jlong memory_soft_limit_in_bytes();
+-    jlong memory_usage_in_bytes();
+-    jlong memory_max_usage_in_bytes();
+-    char * cpu_cpuset_cpus();
+-    char * cpu_cpuset_memory_nodes();
+-
+-    int cpu_quota();
+-    int cpu_period();
+-
+-    int cpu_shares();
+-
+-    const char * container_type() {
+-      return "cgroupv1";
+-    }
+-    CachingCgroupController * memory_controller() { return _memory; }
+-    CachingCgroupController * cpu_controller() { return _cpu; }
+-
+-  private:
+-    julong _unlimited_memory;
+-
+-    /* controllers */
+-    CachingCgroupController* _memory = NULL;
+-    CgroupV1Controller* _cpuset = NULL;
+-    CachingCgroupController* _cpu = NULL;
+-    CgroupV1Controller* _cpuacct = NULL;
+-
+-  public:
+-    CgroupV1Subsystem(CgroupV1Controller* cpuset,
+-                      CgroupV1Controller* cpu,
+-                      CgroupV1Controller* cpuacct,
+-                      CgroupV1MemoryController* memory) {
+-      _cpuset = cpuset;
+-      _cpu = new CachingCgroupController(cpu);
+-      _cpuacct = cpuacct;
+-      _memory = new CachingCgroupController(memory);
+-      _unlimited_memory = (LONG_MAX / os::vm_page_size()) * os::vm_page_size();
+-    }
+-};
+-
+-#endif // CGROUP_V1_SUBSYSTEM_LINUX_HPP
+diff --git a/src/hotspot/os/linux/cgroupV2Subsystem_linux.cpp b/src/hotspot/os/linux/cgroupV2Subsystem_linux.cpp
+deleted file mode 100644
+index 1a4708709..000000000
+--- a/src/hotspot/os/linux/cgroupV2Subsystem_linux.cpp
++++ /dev/null
+@@ -1,235 +0,0 @@
+-/*
+- * Copyright (c) 2020, Red Hat Inc.
+- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+- *
+- * This code is free software; you can redistribute it and/or modify it
+- * under the terms of the GNU General Public License version 2 only, as
+- * published by the Free Software Foundation.
+- *
+- * This code is distributed in the hope that it will be useful, but WITHOUT
+- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+- * version 2 for more details (a copy is included in the LICENSE file that
+- * accompanied this code).
+- *
+- * You should have received a copy of the GNU General Public License version
+- * 2 along with this work; if not, write to the Free Software Foundation,
+- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+- *
+- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+- * or visit www.oracle.com if you need additional information or have any
+- * questions.
+- *
+- */
+-
+-#include "cgroupV2Subsystem_linux.hpp"
+-
+-/* cpu_shares
+- *
+- * Return the amount of cpu shares available to the process
+- *
+- * return:
+- *    Share number (typically a number relative to 1024)
+- *                 (2048 typically expresses 2 CPUs worth of processing)
+- *    -1 for no share setup
+- *    OSCONTAINER_ERROR for not supported
+- */
+-int CgroupV2Subsystem::cpu_shares() {
+-  GET_CONTAINER_INFO(int, _unified, "/cpu.weight",
+-                     "Raw value for CPU shares is: %d", "%d", shares);
+-  // Convert default value of 100 to no shares setup
+-  if (shares == 100) {
+-    log_debug(os, container)("CPU Shares is: %d", -1);
+-    return -1;
+-  }
+-
+-  // CPU shares (OCI) value needs to get translated into
+-  // a proper Cgroups v2 value. See:
+-  // https://github.com/containers/crun/blob/master/crun.1.md#cpu-controller
+-  //
+-  // Use the inverse of (x == OCI value, y == cgroupsv2 value):
+-  // ((262142 * y - 1)/9999) + 2 = x
+-  //
+-  int x = 262142 * shares - 1;
+-  double frac = x/9999.0;
+-  x = ((int)frac) + 2;
+-  log_trace(os, container)("Scaled CPU shares value is: %d", x);
+-  // Since the scaled value is not precise, return the closest
+-  // multiple of PER_CPU_SHARES for a more conservative mapping
+-  if ( x <= PER_CPU_SHARES ) {
+-     // will always map to 1 CPU
+-     log_debug(os, container)("CPU Shares is: %d", x);
+-     return x;
+-  }
+-  int f = x/PER_CPU_SHARES;
+-  int lower_multiple = f * PER_CPU_SHARES;
+-  int upper_multiple = (f + 1) * PER_CPU_SHARES;
+-  int distance_lower = MAX2(lower_multiple, x) - MIN2(lower_multiple, x);
+-  int distance_upper = MAX2(upper_multiple, x) - MIN2(upper_multiple, x);
+-  x = distance_lower <= distance_upper ? lower_multiple : upper_multiple;
+-  log_trace(os, container)("Closest multiple of %d of the CPU Shares value is: %d", PER_CPU_SHARES, x);
+-  log_debug(os, container)("CPU Shares is: %d", x);
+-  return x;
+-}
+-
+-/* cpu_quota
+- *
+- * Return the number of milliseconds per period
+- * process is guaranteed to run.
+- *
+- * return:
+- *    quota time in milliseconds
+- *    -1 for no quota
+- *    OSCONTAINER_ERROR for not supported
+- */
+-int CgroupV2Subsystem::cpu_quota() {
+-  char * cpu_quota_str = cpu_quota_val();
+-  int limit = (int)limit_from_str(cpu_quota_str);
+-  log_trace(os, container)("CPU Quota is: %d", limit);
+-  return limit;
+-}
+-
+-char * CgroupV2Subsystem::cpu_cpuset_cpus() {
+-  GET_CONTAINER_INFO_CPTR(cptr, _unified, "/cpuset.cpus",
+-                     "cpuset.cpus is: %s", "%1023s", cpus, 1024);
+-  if (cpus == NULL) {
+-    return NULL;
+-  }
+-  return os::strdup(cpus);
+-}
+-
+-char* CgroupV2Subsystem::cpu_quota_val() {
+-  GET_CONTAINER_INFO_CPTR(cptr, _unified, "/cpu.max",
+-                     "Raw value for CPU quota is: %s", "%s %*d", quota, 1024);
+-  if (quota == NULL) {
+-    return NULL;
+-  }
+-  return os::strdup(quota);
+-}
+-
+-char * CgroupV2Subsystem::cpu_cpuset_memory_nodes() {
+-  GET_CONTAINER_INFO_CPTR(cptr, _unified, "/cpuset.mems",
+-                     "cpuset.mems is: %s", "%1023s", mems, 1024);
+-  if (mems == NULL) {
+-    return NULL;
+-  }
+-  return os::strdup(mems);
+-}
+-
+-int CgroupV2Subsystem::cpu_period() {
+-  GET_CONTAINER_INFO(int, _unified, "/cpu.max",
+-                     "CPU Period is: %d", "%*s %d", period);
+-  return period;
+-}
+-
+-/* memory_usage_in_bytes
+- *
+- * Return the amount of used memory used by this cgroup and decendents
+- *
+- * return:
+- *    memory usage in bytes or
+- *    -1 for unlimited
+- *    OSCONTAINER_ERROR for not supported
+- */
+-jlong CgroupV2Subsystem::memory_usage_in_bytes() {
+-  GET_CONTAINER_INFO(jlong, _unified, "/memory.current",
+-                     "Memory Usage is: " JLONG_FORMAT, JLONG_FORMAT, memusage);
+-  return memusage;
+-}
+-
+-jlong CgroupV2Subsystem::memory_soft_limit_in_bytes() {
+-  char* mem_soft_limit_str = mem_soft_limit_val();
+-  return limit_from_str(mem_soft_limit_str);
+-}
+-
+-jlong CgroupV2Subsystem::memory_max_usage_in_bytes() {
+-  // Log this string at trace level so as to make tests happy.
+-  log_trace(os, container)("Maximum Memory Usage is not supported.");
+-  return OSCONTAINER_ERROR; // not supported
+-}
+-
+-char* CgroupV2Subsystem::mem_soft_limit_val() {
+-  GET_CONTAINER_INFO_CPTR(cptr, _unified, "/memory.high",
+-                         "Memory Soft Limit is: %s", "%s", mem_soft_limit_str, 1024);
+-  if (mem_soft_limit_str == NULL) {
+-    return NULL;
+-  }
+-  return os::strdup(mem_soft_limit_str);
+-}
+-
+-jlong CgroupV2Subsystem::memory_and_swap_limit_in_bytes() {
+-  char* mem_swp_limit_str = mem_swp_limit_val();
+-  return limit_from_str(mem_swp_limit_str);
+-}
+-
+-char* CgroupV2Subsystem::mem_swp_limit_val() {
+-  GET_CONTAINER_INFO_CPTR(cptr, _unified, "/memory.swap.max",
+-                         "Memory and Swap Limit is: %s", "%s", mem_swp_limit_str, 1024);
+-  if (mem_swp_limit_str == NULL) {
+-    return NULL;
+-  }
+-  return os::strdup(mem_swp_limit_str);
+-}
+-
+-/* memory_limit_in_bytes
+- *
+- * Return the limit of available memory for this process.
+- *
+- * return:
+- *    memory limit in bytes or
+- *    -1 for unlimited, OSCONTAINER_ERROR for an error
+- */
+-jlong CgroupV2Subsystem::read_memory_limit_in_bytes() {
+-  char * mem_limit_str = mem_limit_val();
+-  jlong limit = limit_from_str(mem_limit_str);
+-  if (log_is_enabled(Trace, os, container)) {
+-    if (limit == -1) {
+-      log_trace(os, container)("Memory Limit is: Unlimited");
+-    } else {
+-      log_trace(os, container)("Memory Limit is: " JLONG_FORMAT, limit);
+-    }
+-  }
+-  return limit;
+-}
+-
+-jlong CgroupV2Subsystem::limit_from_str(char* limit_str) {
+-  if (limit_str == NULL) {
+-    return OSCONTAINER_ERROR;
+-  }
+-  // Unlimited memory in Cgroups V2 is the literal string 'max'
+-  if (strcmp("max", limit_str) == 0) {
+-    os::free(limit_str);
+-    return (jlong)-1;
+-  }
+-  julong limit;
+-  if (sscanf(limit_str, JULONG_FORMAT, &limit) != 1) {
+-    os::free(limit_str);
+-    return OSCONTAINER_ERROR;
+-  }
+-  os::free(limit_str);
+-  return (jlong)limit;
+-}
+-
+-char* CgroupV2Subsystem::mem_limit_val() {
+-  GET_CONTAINER_INFO_CPTR(cptr, _unified, "/memory.max",
+-                         "Raw value for memory limit is: %s", "%s", mem_limit_str, 1024);
+-  if (mem_limit_str == NULL) {
+-    return NULL;
+-  }
+-  return os::strdup(mem_limit_str);
+-}
+-
+-char* CgroupV2Controller::construct_path(char* mount_path, char *cgroup_path) {
+-  char buf[MAXPATHLEN+1];
+-  int buflen;
+-  strncpy(buf, mount_path, MAXPATHLEN);
+-  buf[MAXPATHLEN] = '\0';
+-  buflen = strlen(buf);
+-  if ((buflen + strlen(cgroup_path)) > MAXPATHLEN) {
+-    return NULL;
+-  }
+-  strncat(buf, cgroup_path, MAXPATHLEN-buflen);
+-  buf[MAXPATHLEN] = '\0';
+-  return os::strdup(buf);
+-}
+-
+diff --git a/src/hotspot/os/linux/cgroupV2Subsystem_linux.hpp b/src/hotspot/os/linux/cgroupV2Subsystem_linux.hpp
+deleted file mode 100644
+index bd3380e22..000000000
+--- a/src/hotspot/os/linux/cgroupV2Subsystem_linux.hpp
++++ /dev/null
+@@ -1,89 +0,0 @@
+-/*
+- * Copyright (c) 2020, Red Hat Inc.
+- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+- *
+- * This code is free software; you can redistribute it and/or modify it
+- * under the terms of the GNU General Public License version 2 only, as
+- * published by the Free Software Foundation.
+- *
+- * This code is distributed in the hope that it will be useful, but WITHOUT
+- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+- * version 2 for more details (a copy is included in the LICENSE file that
+- * accompanied this code).
+- *
+- * You should have received a copy of the GNU General Public License version
+- * 2 along with this work; if not, write to the Free Software Foundation,
+- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+- *
+- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+- * or visit www.oracle.com if you need additional information or have any
+- * questions.
+- *
+- */
+-
+-#ifndef CGROUP_V2_SUBSYSTEM_LINUX_HPP
+-#define CGROUP_V2_SUBSYSTEM_LINUX_HPP
+-
+-#include "cgroupSubsystem_linux.hpp"
+-
+-class CgroupV2Controller: public CgroupController {
+-  private:
+-    /* the mount path of the cgroup v2 hierarchy */
+-    char *_mount_path;
+-    /* The cgroup path for the controller */
+-    char *_cgroup_path;
+-
+-    /* Constructed full path to the subsystem directory */
+-    char *_path;
+-    static char* construct_path(char* mount_path, char *cgroup_path);
+-
+-  public:
+-    CgroupV2Controller(char * mount_path, char *cgroup_path) {
+-      _mount_path = mount_path;
+-      _cgroup_path = os::strdup(cgroup_path);
+-      _path = construct_path(mount_path, cgroup_path);
+-    }
+-
+-    char *subsystem_path() { return _path; }
+-};
+-
+-class CgroupV2Subsystem: public CgroupSubsystem {
+-  private:
+-    /* One unified controller */
+-    CgroupController* _unified = NULL;
+-    /* Caching wrappers for cpu/memory metrics */
+-    CachingCgroupController* _memory = NULL;
+-    CachingCgroupController* _cpu = NULL;
+-
+-    char *mem_limit_val();
+-    char *mem_swp_limit_val();
+-    char *mem_soft_limit_val();
+-    char *cpu_quota_val();
+-    jlong limit_from_str(char* limit_str);
+-
+-  public:
+-    CgroupV2Subsystem(CgroupController * unified) {
+-      _unified = unified;
+-      _memory = new CachingCgroupController(unified);
+-      _cpu = new CachingCgroupController(unified);
+-    }
+-
+-    jlong read_memory_limit_in_bytes();
+-    int cpu_quota();
+-    int cpu_period();
+-    int cpu_shares();
+-    jlong memory_and_swap_limit_in_bytes();
+-    jlong memory_soft_limit_in_bytes();
+-    jlong memory_usage_in_bytes();
+-    jlong memory_max_usage_in_bytes();
+-    char * cpu_cpuset_cpus();
+-    char * cpu_cpuset_memory_nodes();
+-    const char * container_type() {
+-      return "cgroupv2";
+-    }
+-    CachingCgroupController * memory_controller() { return _memory; }
+-    CachingCgroupController * cpu_controller() { return _cpu; }
+-};
+-
+-#endif // CGROUP_V2_SUBSYSTEM_LINUX_HPP
+diff --git a/src/hotspot/os/linux/osContainer_linux.cpp b/src/hotspot/os/linux/osContainer_linux.cpp
+index b89cfd676..99784a128 100644
+--- a/src/hotspot/os/linux/osContainer_linux.cpp
++++ b/src/hotspot/os/linux/osContainer_linux.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2017, 2020, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2017, 2019, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -25,16 +25,275 @@
+ #include <string.h>
+ #include <math.h>
+ #include <errno.h>
++#include "utilities/globalDefinitions.hpp"
++#include "memory/allocation.hpp"
+ #include "runtime/globals.hpp"
+ #include "runtime/os.hpp"
+ #include "logging/log.hpp"
+ #include "osContainer_linux.hpp"
+-#include "cgroupSubsystem_linux.hpp"
+ 
++/*
++ * PER_CPU_SHARES has been set to 1024 because CPU shares' quota
++ * is commonly used in cloud frameworks like Kubernetes[1],
++ * AWS[2] and Mesos[3] in a similar way. They spawn containers with
++ * --cpu-shares option values scaled by PER_CPU_SHARES. Thus, we do
++ * the inverse for determining the number of possible available
++ * CPUs to the JVM inside a container. See JDK-8216366.
++ *
++ * [1] https://kubernetes.io/docs/concepts/configuration/manage-compute-resources-container/#meaning-of-cpu
++ *     In particular:
++ *        When using Docker:
++ *          The spec.containers[].resources.requests.cpu is converted to its core value, which is potentially
++ *          fractional, and multiplied by 1024. The greater of this number or 2 is used as the value of the
++ *          --cpu-shares flag in the docker run command.
++ * [2] https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_ContainerDefinition.html
++ * [3] https://github.com/apache/mesos/blob/3478e344fb77d931f6122980c6e94cd3913c441d/src/docker/docker.cpp#L648
++ *     https://github.com/apache/mesos/blob/3478e344fb77d931f6122980c6e94cd3913c441d/src/slave/containerizer/mesos/isolators/cgroups/constants.hpp#L30
++ */
++#define PER_CPU_SHARES 1024
+ 
+ bool  OSContainer::_is_initialized   = false;
+ bool  OSContainer::_is_containerized = false;
+-CgroupSubsystem* cgroup_subsystem;
++int   OSContainer::_active_processor_count = 1;
++julong _unlimited_memory;
++
++class CgroupSubsystem: CHeapObj<mtInternal> {
++ friend class OSContainer;
++
++
++ private:
++    volatile jlong _next_check_counter;
++
++    /* mountinfo contents */
++    char *_root;
++    char *_mount_point;
++
++    /* Constructed subsystem directory */
++    char *_path;
++
++ public:
++    CgroupSubsystem(char *root, char *mountpoint) {
++      _root = os::strdup(root);
++      _mount_point = os::strdup(mountpoint);
++      _path = NULL;
++      _next_check_counter = min_jlong;
++    }
++
++    /*
++     * Set directory to subsystem specific files based
++     * on the contents of the mountinfo and cgroup files.
++     */
++    void set_subsystem_path(char *cgroup_path) {
++      char buf[MAXPATHLEN+1];
++      if (_root != NULL && cgroup_path != NULL) {
++        if (strcmp(_root, "/") == 0) {
++          int buflen;
++          strncpy(buf, _mount_point, MAXPATHLEN);
++          buf[MAXPATHLEN-1] = '\0';
++          if (strcmp(cgroup_path,"/") != 0) {
++            buflen = strlen(buf);
++            if ((buflen + strlen(cgroup_path)) > (MAXPATHLEN-1)) {
++              return;
++            }
++            strncat(buf, cgroup_path, MAXPATHLEN-buflen);
++            buf[MAXPATHLEN-1] = '\0';
++          }
++          _path = os::strdup(buf);
++        } else {
++          if (strcmp(_root, cgroup_path) == 0) {
++            strncpy(buf, _mount_point, MAXPATHLEN);
++            buf[MAXPATHLEN-1] = '\0';
++            _path = os::strdup(buf);
++          } else {
++            char *p = strstr(cgroup_path, _root);
++            if (p != NULL && p == _root) {
++              if (strlen(cgroup_path) > strlen(_root)) {
++                int buflen;
++                strncpy(buf, _mount_point, MAXPATHLEN);
++                buf[MAXPATHLEN-1] = '\0';
++                buflen = strlen(buf);
++                if ((buflen + strlen(cgroup_path) - strlen(_root)) > (MAXPATHLEN-1)) {
++                  return;
++                }
++                strncat(buf, cgroup_path + strlen(_root), MAXPATHLEN-buflen);
++                buf[MAXPATHLEN-1] = '\0';
++                _path = os::strdup(buf);
++              }
++            }
++          }
++        }
++      }
++    }
++
++    char *subsystem_path() { return _path; }
++
++    bool cache_has_expired() {
++      return os::elapsed_counter() > _next_check_counter;
++    }
++
++    void set_cache_expiry_time(jlong timeout) {
++      _next_check_counter = os::elapsed_counter() + timeout;
++    }
++};
++
++class CgroupMemorySubsystem: CgroupSubsystem {
++ friend class OSContainer;
++
++ private:
++    /* Some container runtimes set limits via cgroup
++     * hierarchy. If set to true consider also memory.stat
++     * file if everything else seems unlimited */
++    bool _uses_mem_hierarchy;
++    volatile jlong _memory_limit_in_bytes;
++
++ public:
++    CgroupMemorySubsystem(char *root, char *mountpoint) : CgroupSubsystem::CgroupSubsystem(root, mountpoint) {
++      _uses_mem_hierarchy = false;
++      _memory_limit_in_bytes = -1;
++
++    }
++
++    bool is_hierarchical() { return _uses_mem_hierarchy; }
++    void set_hierarchical(bool value) { _uses_mem_hierarchy = value; }
++
++    jlong memory_limit_in_bytes() { return _memory_limit_in_bytes; }
++    void set_memory_limit_in_bytes(jlong value) {
++      _memory_limit_in_bytes = value;
++      // max memory limit is unlikely to change, but we want to remain
++      // responsive to configuration changes. A very short grace time
++      // between re-read avoids excessive overhead during startup without
++      // significantly reducing the VMs ability to promptly react to reduced
++      // memory availability
++      set_cache_expiry_time(OSCONTAINER_CACHE_TIMEOUT);
++    }
++
++};
++
++CgroupMemorySubsystem* memory = NULL;
++CgroupSubsystem* cpuset = NULL;
++CgroupSubsystem* cpu = NULL;
++CgroupSubsystem* cpuacct = NULL;
++
++typedef char * cptr;
++
++PRAGMA_DIAG_PUSH
++PRAGMA_FORMAT_NONLITERAL_IGNORED
++template <typename T> int subsystem_file_line_contents(CgroupSubsystem* c,
++                                              const char *filename,
++                                              const char *matchline,
++                                              const char *scan_fmt,
++                                              T returnval) {
++  FILE *fp = NULL;
++  char *p;
++  char file[MAXPATHLEN+1];
++  char buf[MAXPATHLEN+1];
++  char discard[MAXPATHLEN+1];
++  bool found_match = false;
++
++  if (c == NULL) {
++    log_debug(os, container)("subsystem_file_line_contents: CgroupSubsytem* is NULL");
++    return OSCONTAINER_ERROR;
++  }
++  if (c->subsystem_path() == NULL) {
++    log_debug(os, container)("subsystem_file_line_contents: subsystem path is NULL");
++    return OSCONTAINER_ERROR;
++  }
++
++  strncpy(file, c->subsystem_path(), MAXPATHLEN);
++  file[MAXPATHLEN-1] = '\0';
++  int filelen = strlen(file);
++  if ((filelen + strlen(filename)) > (MAXPATHLEN-1)) {
++    log_debug(os, container)("File path too long %s, %s", file, filename);
++    return OSCONTAINER_ERROR;
++  }
++  strncat(file, filename, MAXPATHLEN-filelen);
++  log_trace(os, container)("Path to %s is %s", filename, file);
++  fp = fopen(file, "r");
++  if (fp != NULL) {
++    int err = 0;
++    while ((p = fgets(buf, MAXPATHLEN, fp)) != NULL) {
++      found_match = false;
++      if (matchline == NULL) {
++        // single-line file case
++        int matched = sscanf(p, scan_fmt, returnval);
++        found_match = (matched == 1);
++      } else {
++        // multi-line file case
++        if (strstr(p, matchline) != NULL) {
++          // discard matchline string prefix
++          int matched = sscanf(p, scan_fmt, discard, returnval);
++          found_match = (matched == 2);
++        } else {
++          continue; // substring not found
++        }
++      }
++      if (found_match) {
++        fclose(fp);
++        return 0;
++      } else {
++        err = 1;
++        log_debug(os, container)("Type %s not found in file %s", scan_fmt, file);
++      }
++    }
++    if (err == 0) {
++      log_debug(os, container)("Empty file %s", file);
++    }
++  } else {
++    log_debug(os, container)("Open of file %s failed, %s", file, os::strerror(errno));
++  }
++  if (fp != NULL)
++    fclose(fp);
++  return OSCONTAINER_ERROR;
++}
++PRAGMA_DIAG_POP
++
++#define GET_CONTAINER_INFO(return_type, subsystem, filename,              \
++                           logstring, scan_fmt, variable)                 \
++  return_type variable;                                                   \
++{                                                                         \
++  int err;                                                                \
++  err = subsystem_file_line_contents(subsystem,                           \
++                                     filename,                            \
++                                     NULL,                                \
++                                     scan_fmt,                            \
++                                     &variable);                          \
++  if (err != 0)                                                           \
++    return (return_type) OSCONTAINER_ERROR;                               \
++                                                                          \
++  log_trace(os, container)(logstring, variable);                          \
++}
++
++#define GET_CONTAINER_INFO_CPTR(return_type, subsystem, filename,         \
++                               logstring, scan_fmt, variable, bufsize)    \
++  char variable[bufsize];                                                 \
++{                                                                         \
++  int err;                                                                \
++  err = subsystem_file_line_contents(subsystem,                           \
++                                     filename,                            \
++                                     NULL,                                \
++                                     scan_fmt,                            \
++                                     variable);                           \
++  if (err != 0)                                                           \
++    return (return_type) NULL;                                            \
++                                                                          \
++  log_trace(os, container)(logstring, variable);                          \
++}
++
++#define GET_CONTAINER_INFO_LINE(return_type, subsystem, filename,         \
++                           matchline, logstring, scan_fmt, variable)      \
++  return_type variable;                                                   \
++{                                                                         \
++  int err;                                                                \
++  err = subsystem_file_line_contents(subsystem,                           \
++                                filename,                                 \
++                                matchline,                                \
++                                scan_fmt,                                 \
++                                &variable);                               \
++  if (err != 0)                                                           \
++    return (return_type) OSCONTAINER_ERROR;                               \
++                                                                          \
++  log_trace(os, container)(logstring, variable);                          \
++}
+ 
+ /* init
+  *
+@@ -42,6 +301,12 @@ CgroupSubsystem* cgroup_subsystem;
+  * we are running under cgroup control.
+  */
+ void OSContainer::init() {
++  FILE *mntinfo = NULL;
++  FILE *cgroup = NULL;
++  char buf[MAXPATHLEN+1];
++  char tmproot[MAXPATHLEN+1];
++  char tmpmount[MAXPATHLEN+1];
++  char *p;
+   jlong mem_limit;
+ 
+   assert(!_is_initialized, "Initializing OSContainer more than once");
+@@ -49,19 +314,139 @@ void OSContainer::init() {
+   _is_initialized = true;
+   _is_containerized = false;
+ 
++  _unlimited_memory = (LONG_MAX / os::vm_page_size()) * os::vm_page_size();
++
+   log_trace(os, container)("OSContainer::init: Initializing Container Support");
+   if (!UseContainerSupport) {
+     log_trace(os, container)("Container Support not enabled");
+     return;
+   }
+ 
+-  cgroup_subsystem = CgroupSubsystemFactory::create();
+-  if (cgroup_subsystem == NULL) {
+-    return; // Required subsystem files not found or other error
++  /*
++   * Find the cgroup mount point for memory and cpuset
++   * by reading /proc/self/mountinfo
++   *
++   * Example for docker:
++   * 219 214 0:29 /docker/7208cebd00fa5f2e342b1094f7bed87fa25661471a4637118e65f1c995be8a34 /sys/fs/cgroup/memory ro,nosuid,nodev,noexec,relatime - cgroup cgroup rw,memory
++   *
++   * Example for host:
++   * 34 28 0:29 / /sys/fs/cgroup/memory rw,nosuid,nodev,noexec,relatime shared:16 - cgroup cgroup rw,memory
++   */
++  mntinfo = fopen("/proc/self/mountinfo", "r");
++  if (mntinfo == NULL) {
++      log_debug(os, container)("Can't open /proc/self/mountinfo, %s",
++                               os::strerror(errno));
++      return;
++  }
++
++  while ((p = fgets(buf, MAXPATHLEN, mntinfo)) != NULL) {
++    char tmpcgroups[MAXPATHLEN+1];
++    char *cptr = tmpcgroups;
++    char *token;
++
++    // mountinfo format is documented at https://www.kernel.org/doc/Documentation/filesystems/proc.txt
++    if (sscanf(p, "%*d %*d %*d:%*d %s %s %*[^-]- cgroup %*s %s", tmproot, tmpmount, tmpcgroups) != 3) {
++      continue;
++    }
++    while ((token = strsep(&cptr, ",")) != NULL) {
++      if (strcmp(token, "memory") == 0) {
++        memory = new CgroupMemorySubsystem(tmproot, tmpmount);
++      } else if (strcmp(token, "cpuset") == 0) {
++        cpuset = new CgroupSubsystem(tmproot, tmpmount);
++      } else if (strcmp(token, "cpu") == 0) {
++        cpu = new CgroupSubsystem(tmproot, tmpmount);
++      } else if (strcmp(token, "cpuacct") == 0) {
++        cpuacct= new CgroupSubsystem(tmproot, tmpmount);
++      }
++    }
++  }
++
++  fclose(mntinfo);
++
++  if (memory == NULL) {
++    log_debug(os, container)("Required cgroup memory subsystem not found");
++    return;
++  }
++  if (cpuset == NULL) {
++    log_debug(os, container)("Required cgroup cpuset subsystem not found");
++    return;
++  }
++  if (cpu == NULL) {
++    log_debug(os, container)("Required cgroup cpu subsystem not found");
++    return;
++  }
++  if (cpuacct == NULL) {
++    log_debug(os, container)("Required cgroup cpuacct subsystem not found");
++    return;
++  }
++
++  /*
++   * Read /proc/self/cgroup and map host mount point to
++   * local one via /proc/self/mountinfo content above
++   *
++   * Docker example:
++   * 5:memory:/docker/6558aed8fc662b194323ceab5b964f69cf36b3e8af877a14b80256e93aecb044
++   *
++   * Host example:
++   * 5:memory:/user.slice
++   *
++   * Construct a path to the process specific memory and cpuset
++   * cgroup directory.
++   *
++   * For a container running under Docker from memory example above
++   * the paths would be:
++   *
++   * /sys/fs/cgroup/memory
++   *
++   * For a Host from memory example above the path would be:
++   *
++   * /sys/fs/cgroup/memory/user.slice
++   *
++   */
++  cgroup = fopen("/proc/self/cgroup", "r");
++  if (cgroup == NULL) {
++    log_debug(os, container)("Can't open /proc/self/cgroup, %s",
++                             os::strerror(errno));
++    return;
+   }
++
++  while ((p = fgets(buf, MAXPATHLEN, cgroup)) != NULL) {
++    char *controllers;
++    char *token;
++    char *base;
++
++    /* Skip cgroup number */
++    strsep(&p, ":");
++    /* Get controllers and base */
++    controllers = strsep(&p, ":");
++    base = strsep(&p, "\n");
++
++    if (controllers == NULL) {
++      continue;
++    }
++
++    while ((token = strsep(&controllers, ",")) != NULL) {
++      if (strcmp(token, "memory") == 0) {
++        memory->set_subsystem_path(base);
++        jlong hierarchy = uses_mem_hierarchy();
++        if (hierarchy > 0) {
++          memory->set_hierarchical(true);
++        }
++      } else if (strcmp(token, "cpuset") == 0) {
++        cpuset->set_subsystem_path(base);
++      } else if (strcmp(token, "cpu") == 0) {
++        cpu->set_subsystem_path(base);
++      } else if (strcmp(token, "cpuacct") == 0) {
++        cpuacct->set_subsystem_path(base);
++      }
++    }
++  }
++
++  fclose(cgroup);
++
+   // We need to update the amount of physical memory now that
+-  // cgroup subsystem files have been processed.
+-  if ((mem_limit = cgroup_subsystem->memory_limit_in_bytes()) > 0) {
++  // command line arguments have been processed.
++  if ((mem_limit = memory_limit_in_bytes()) > 0) {
+     os::Linux::set_physical_memory(mem_limit);
+     log_info(os, container)("Memory Limit is: " JLONG_FORMAT, mem_limit);
+   }
+@@ -71,61 +456,272 @@ void OSContainer::init() {
+ }
+ 
+ const char * OSContainer::container_type() {
+-  assert(cgroup_subsystem != NULL, "cgroup subsystem not available");
+-  return cgroup_subsystem->container_type();
++  if (is_containerized()) {
++    return "cgroupv1";
++  } else {
++    return NULL;
++  }
++}
++
++/* uses_mem_hierarchy
++ *
++ * Return whether or not hierarchical cgroup accounting is being
++ * done.
++ *
++ * return:
++ *    A number > 0 if true, or
++ *    OSCONTAINER_ERROR for not supported
++ */
++jlong OSContainer::uses_mem_hierarchy() {
++  GET_CONTAINER_INFO(jlong, memory, "/memory.use_hierarchy",
++                    "Use Hierarchy is: " JLONG_FORMAT, JLONG_FORMAT, use_hierarchy);
++  return use_hierarchy;
+ }
+ 
++
++/* memory_limit_in_bytes
++ *
++ * Return the limit of available memory for this process.
++ *
++ * return:
++ *    memory limit in bytes or
++ *    -1 for unlimited
++ *    OSCONTAINER_ERROR for not supported
++ */
+ jlong OSContainer::memory_limit_in_bytes() {
+-  assert(cgroup_subsystem != NULL, "cgroup subsystem not available");
+-  return cgroup_subsystem->memory_limit_in_bytes();
++  if (!memory->cache_has_expired()) {
++    return memory->memory_limit_in_bytes();
++  }
++  jlong memory_limit = read_memory_limit_in_bytes();
++  // Update CgroupMemorySubsystem to avoid re-reading container settings too often
++  memory->set_memory_limit_in_bytes(memory_limit);
++  return memory_limit;
++}
++
++jlong OSContainer::read_memory_limit_in_bytes() {
++  GET_CONTAINER_INFO(julong, memory, "/memory.limit_in_bytes",
++                     "Memory Limit is: " JULONG_FORMAT, JULONG_FORMAT, memlimit);
++
++  if (memlimit >= _unlimited_memory) {
++    log_trace(os, container)("Non-Hierarchical Memory Limit is: Unlimited");
++    if (memory->is_hierarchical()) {
++      const char* matchline = "hierarchical_memory_limit";
++      const char* format = "%s " JULONG_FORMAT;
++      GET_CONTAINER_INFO_LINE(julong, memory, "/memory.stat", matchline,
++                             "Hierarchical Memory Limit is: " JULONG_FORMAT, format, hier_memlimit)
++      if (hier_memlimit >= _unlimited_memory) {
++        log_trace(os, container)("Hierarchical Memory Limit is: Unlimited");
++      } else {
++        return (jlong)hier_memlimit;
++      }
++    }
++    return (jlong)-1;
++  }
++  else {
++    return (jlong)memlimit;
++  }
+ }
+ 
+ jlong OSContainer::memory_and_swap_limit_in_bytes() {
+-  assert(cgroup_subsystem != NULL, "cgroup subsystem not available");
+-  return cgroup_subsystem->memory_and_swap_limit_in_bytes();
++  GET_CONTAINER_INFO(julong, memory, "/memory.memsw.limit_in_bytes",
++                     "Memory and Swap Limit is: " JULONG_FORMAT, JULONG_FORMAT, memswlimit);
++  if (memswlimit >= _unlimited_memory) {
++    log_trace(os, container)("Non-Hierarchical Memory and Swap Limit is: Unlimited");
++    if (memory->is_hierarchical()) {
++      const char* matchline = "hierarchical_memsw_limit";
++      const char* format = "%s " JULONG_FORMAT;
++      GET_CONTAINER_INFO_LINE(julong, memory, "/memory.stat", matchline,
++                             "Hierarchical Memory and Swap Limit is : " JULONG_FORMAT, format, hier_memlimit)
++      if (hier_memlimit >= _unlimited_memory) {
++        log_trace(os, container)("Hierarchical Memory and Swap Limit is: Unlimited");
++      } else {
++        return (jlong)hier_memlimit;
++      }
++    }
++    return (jlong)-1;
++  } else {
++    return (jlong)memswlimit;
++  }
+ }
+ 
+ jlong OSContainer::memory_soft_limit_in_bytes() {
+-  assert(cgroup_subsystem != NULL, "cgroup subsystem not available");
+-  return cgroup_subsystem->memory_soft_limit_in_bytes();
++  GET_CONTAINER_INFO(julong, memory, "/memory.soft_limit_in_bytes",
++                     "Memory Soft Limit is: " JULONG_FORMAT, JULONG_FORMAT, memsoftlimit);
++  if (memsoftlimit >= _unlimited_memory) {
++    log_trace(os, container)("Memory Soft Limit is: Unlimited");
++    return (jlong)-1;
++  } else {
++    return (jlong)memsoftlimit;
++  }
+ }
+ 
++/* memory_usage_in_bytes
++ *
++ * Return the amount of used memory for this process.
++ *
++ * return:
++ *    memory usage in bytes or
++ *    -1 for unlimited
++ *    OSCONTAINER_ERROR for not supported
++ */
+ jlong OSContainer::memory_usage_in_bytes() {
+-  assert(cgroup_subsystem != NULL, "cgroup subsystem not available");
+-  return cgroup_subsystem->memory_usage_in_bytes();
++  GET_CONTAINER_INFO(jlong, memory, "/memory.usage_in_bytes",
++                     "Memory Usage is: " JLONG_FORMAT, JLONG_FORMAT, memusage);
++  return memusage;
+ }
+ 
++/* memory_max_usage_in_bytes
++ *
++ * Return the maximum amount of used memory for this process.
++ *
++ * return:
++ *    max memory usage in bytes or
++ *    OSCONTAINER_ERROR for not supported
++ */
+ jlong OSContainer::memory_max_usage_in_bytes() {
+-  assert(cgroup_subsystem != NULL, "cgroup subsystem not available");
+-  return cgroup_subsystem->memory_max_usage_in_bytes();
++  GET_CONTAINER_INFO(jlong, memory, "/memory.max_usage_in_bytes",
++                     "Maximum Memory Usage is: " JLONG_FORMAT, JLONG_FORMAT, memmaxusage);
++  return memmaxusage;
+ }
+ 
+-char * OSContainer::cpu_cpuset_cpus() {
+-  assert(cgroup_subsystem != NULL, "cgroup subsystem not available");
+-  return cgroup_subsystem->cpu_cpuset_cpus();
++/* active_processor_count
++ *
++ * Calculate an appropriate number of active processors for the
++ * VM to use based on these three inputs.
++ *
++ * cpu affinity
++ * cgroup cpu quota & cpu period
++ * cgroup cpu shares
++ *
++ * Algorithm:
++ *
++ * Determine the number of available CPUs from sched_getaffinity
++ *
++ * If user specified a quota (quota != -1), calculate the number of
++ * required CPUs by dividing quota by period.
++ *
++ * If shares are in effect (shares != -1), calculate the number
++ * of CPUs required for the shares by dividing the share value
++ * by PER_CPU_SHARES.
++ *
++ * All results of division are rounded up to the next whole number.
++ *
++ * If neither shares or quotas have been specified, return the
++ * number of active processors in the system.
++ *
++ * If both shares and quotas have been specified, the results are
++ * based on the flag PreferContainerQuotaForCPUCount.  If true,
++ * return the quota value.  If false return the smallest value
++ * between shares or quotas.
++ *
++ * If shares and/or quotas have been specified, the resulting number
++ * returned will never exceed the number of active processors.
++ *
++ * return:
++ *    number of CPUs
++ */
++int OSContainer::active_processor_count() {
++  int quota_count = 0, share_count = 0;
++  int cpu_count, limit_count;
++  int result;
++
++  // We use a cache with a timeout to avoid performing expensive
++  // computations in the event this function is called frequently.
++  // [See 8227006].
++  if (!cpu->cache_has_expired()) {
++    log_trace(os, container)("OSContainer::active_processor_count (cached): %d", OSContainer::_active_processor_count);
++    return OSContainer::_active_processor_count;
++  }
++
++  cpu_count = limit_count = os::Linux::active_processor_count();
++  int quota  = cpu_quota();
++  int period = cpu_period();
++  int share  = cpu_shares();
++
++  if (quota > -1 && period > 0) {
++    quota_count = ceilf((float)quota / (float)period);
++    log_trace(os, container)("CPU Quota count based on quota/period: %d", quota_count);
++  }
++  if (share > -1) {
++    share_count = ceilf((float)share / (float)PER_CPU_SHARES);
++    log_trace(os, container)("CPU Share count based on shares: %d", share_count);
++  }
++
++  // If both shares and quotas are setup results depend
++  // on flag PreferContainerQuotaForCPUCount.
++  // If true, limit CPU count to quota
++  // If false, use minimum of shares and quotas
++  if (quota_count !=0 && share_count != 0) {
++    if (PreferContainerQuotaForCPUCount) {
++      limit_count = quota_count;
++    } else {
++      limit_count = MIN2(quota_count, share_count);
++    }
++  } else if (quota_count != 0) {
++    limit_count = quota_count;
++  } else if (share_count != 0) {
++    limit_count = share_count;
++  }
++
++  result = MIN2(cpu_count, limit_count);
++  log_trace(os, container)("OSContainer::active_processor_count: %d", result);
++
++  // Update the value and reset the cache timeout
++  OSContainer::_active_processor_count = result;
++  cpu->set_cache_expiry_time(OSCONTAINER_CACHE_TIMEOUT);
++
++  return result;
+ }
+ 
+-char * OSContainer::cpu_cpuset_memory_nodes() {
+-  assert(cgroup_subsystem != NULL, "cgroup subsystem not available");
+-  return cgroup_subsystem->cpu_cpuset_memory_nodes();
++char * OSContainer::cpu_cpuset_cpus() {
++  GET_CONTAINER_INFO_CPTR(cptr, cpuset, "/cpuset.cpus",
++                     "cpuset.cpus is: %s", "%1023s", cpus, 1024);
++  return os::strdup(cpus);
+ }
+ 
+-int OSContainer::active_processor_count() {
+-  assert(cgroup_subsystem != NULL, "cgroup subsystem not available");
+-  return cgroup_subsystem->active_processor_count();
++char * OSContainer::cpu_cpuset_memory_nodes() {
++  GET_CONTAINER_INFO_CPTR(cptr, cpuset, "/cpuset.mems",
++                     "cpuset.mems is: %s", "%1023s", mems, 1024);
++  return os::strdup(mems);
+ }
+ 
++/* cpu_quota
++ *
++ * Return the number of milliseconds per period
++ * process is guaranteed to run.
++ *
++ * return:
++ *    quota time in milliseconds
++ *    -1 for no quota
++ *    OSCONTAINER_ERROR for not supported
++ */
+ int OSContainer::cpu_quota() {
+-  assert(cgroup_subsystem != NULL, "cgroup subsystem not available");
+-  return cgroup_subsystem->cpu_quota();
++  GET_CONTAINER_INFO(int, cpu, "/cpu.cfs_quota_us",
++                     "CPU Quota is: %d", "%d", quota);
++  return quota;
+ }
+ 
+ int OSContainer::cpu_period() {
+-  assert(cgroup_subsystem != NULL, "cgroup subsystem not available");
+-  return cgroup_subsystem->cpu_period();
++  GET_CONTAINER_INFO(int, cpu, "/cpu.cfs_period_us",
++                     "CPU Period is: %d", "%d", period);
++  return period;
+ }
+ 
++/* cpu_shares
++ *
++ * Return the amount of cpu shares available to the process
++ *
++ * return:
++ *    Share number (typically a number relative to 1024)
++ *                 (2048 typically expresses 2 CPUs worth of processing)
++ *    -1 for no share setup
++ *    OSCONTAINER_ERROR for not supported
++ */
+ int OSContainer::cpu_shares() {
+-  assert(cgroup_subsystem != NULL, "cgroup subsystem not available");
+-  return cgroup_subsystem->cpu_shares();
++  GET_CONTAINER_INFO(int, cpu, "/cpu.shares",
++                     "CPU Shares is: %d", "%d", shares);
++  // Convert 1024 to no shares setup
++  if (shares == 1024) return -1;
++
++  return shares;
+ }
+diff --git a/src/hotspot/os/linux/osContainer_linux.hpp b/src/hotspot/os/linux/osContainer_linux.hpp
+index 8775288d4..93b3202a6 100644
+--- a/src/hotspot/os/linux/osContainer_linux.hpp
++++ b/src/hotspot/os/linux/osContainer_linux.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2017, 2020, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2017, 2019, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -48,6 +48,7 @@ class OSContainer: AllStatic {
+   static inline bool is_containerized();
+   static const char * container_type();
+ 
++  static jlong uses_mem_hierarchy();
+   static jlong memory_limit_in_bytes();
+   static jlong memory_and_swap_limit_in_bytes();
+   static jlong memory_soft_limit_in_bytes();
+diff --git a/src/hotspot/os/linux/os_linux.hpp b/src/hotspot/os/linux/os_linux.hpp
+index 0687d0301..2afb05f28 100644
+--- a/src/hotspot/os/linux/os_linux.hpp
++++ b/src/hotspot/os/linux/os_linux.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 1999, 2020, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 1999, 2019, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -31,7 +31,6 @@
+ static bool zero_page_read_protected() { return true; }
+ 
+ class Linux {
+-  friend class CgroupSubsystem;
+   friend class os;
+   friend class OSContainer;
+   friend class TestReserveMemorySpecial;
+diff --git a/src/hotspot/share/prims/whitebox.cpp b/src/hotspot/share/prims/whitebox.cpp
+index 54d014145..edd088e4b 100644
+--- a/src/hotspot/share/prims/whitebox.cpp
++++ b/src/hotspot/share/prims/whitebox.cpp
+@@ -108,7 +108,6 @@
+ 
+ #ifdef LINUX
+ #include "osContainer_linux.hpp"
+-#include "cgroupSubsystem_linux.hpp"
+ #endif
+ 
+ #define SIZE_T_MAX_VALUE ((size_t) -1)
+@@ -1021,18 +1020,6 @@ WB_ENTRY(jboolean, WB_TestSetForceInlineMethod(JNIEnv* env, jobject o, jobject m
+   return result;
+ WB_END
+ 
+-#ifdef LINUX
+-bool WhiteBox::validate_cgroup(const char* proc_cgroups,
+-                               const char* proc_self_cgroup,
+-                               const char* proc_self_mountinfo,
+-                               u1* cg_flags) {
+-  CgroupInfo cg_infos[4];
+-  return CgroupSubsystemFactory::determine_type(cg_infos, proc_cgroups,
+-                                                    proc_self_cgroup,
+-                                                    proc_self_mountinfo, cg_flags);
+-}
+-#endif
+-
+ bool WhiteBox::compile_method(Method* method, int comp_level, int bci, Thread* THREAD) {
+   // Screen for unavailable/bad comp level or null method
+   AbstractCompiler* comp = CompileBroker::compiler(comp_level);
+@@ -2184,31 +2171,6 @@ WB_ENTRY(jboolean, WB_IsContainerized(JNIEnv* env, jobject o))
+   return false;
+ WB_END
+ 
+-WB_ENTRY(jint, WB_ValidateCgroup(JNIEnv* env,
+-                                    jobject o,
+-                                    jstring proc_cgroups,
+-                                    jstring proc_self_cgroup,
+-                                    jstring proc_self_mountinfo))
+-  jint ret = 0;
+-#ifdef LINUX
+-  ThreadToNativeFromVM ttnfv(thread);
+-  const char* p_cgroups = env->GetStringUTFChars(proc_cgroups, NULL);
+-  CHECK_JNI_EXCEPTION_(env, 0);
+-  const char* p_s_cgroup = env->GetStringUTFChars(proc_self_cgroup, NULL);
+-  CHECK_JNI_EXCEPTION_(env, 0);
+-  const char* p_s_mountinfo = env->GetStringUTFChars(proc_self_mountinfo, NULL);
+-  CHECK_JNI_EXCEPTION_(env, 0);
+-  u1 cg_type_flags = 0;
+-  // This sets cg_type_flags
+-  WhiteBox::validate_cgroup(p_cgroups, p_s_cgroup, p_s_mountinfo, &cg_type_flags);
+-  ret = (jint)cg_type_flags;
+-  env->ReleaseStringUTFChars(proc_cgroups, p_cgroups);
+-  env->ReleaseStringUTFChars(proc_self_cgroup, p_s_cgroup);
+-  env->ReleaseStringUTFChars(proc_self_mountinfo, p_s_mountinfo);
+-#endif
+-  return ret;
+-WB_END
+-
+ WB_ENTRY(void, WB_PrintOsInfo(JNIEnv* env, jobject o))
+   os::print_os_info(tty);
+ WB_END
+@@ -2537,9 +2499,6 @@ static JNINativeMethod methods[] = {
+   {CC"checkLibSpecifiesNoexecstack", CC"(Ljava/lang/String;)Z",
+                                                       (void*)&WB_CheckLibSpecifiesNoexecstack},
+   {CC"isContainerized",           CC"()Z",            (void*)&WB_IsContainerized },
+-  {CC"validateCgroup",
+-      CC"(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I",
+-                                                      (void*)&WB_ValidateCgroup },
+   {CC"printOsInfo",               CC"()V",            (void*)&WB_PrintOsInfo },
+   {CC"disableElfSectionCache",    CC"()V",            (void*)&WB_DisableElfSectionCache },
+   {CC"resolvedMethodItemsCount",  CC"()J",            (void*)&WB_ResolvedMethodItemsCount },
+diff --git a/src/hotspot/share/prims/whitebox.hpp b/src/hotspot/share/prims/whitebox.hpp
+index 20bcc919f..49ce72856 100644
+--- a/src/hotspot/share/prims/whitebox.hpp
++++ b/src/hotspot/share/prims/whitebox.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2012, 2020, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2012, 2019, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -68,9 +68,6 @@ class WhiteBox : public AllStatic {
+     JNINativeMethod* method_array, int method_count);
+   static void register_extended(JNIEnv* env, jclass wbclass, JavaThread* thread);
+   static bool compile_method(Method* method, int comp_level, int bci, Thread* THREAD);
+-#ifdef LINUX
+-  static bool validate_cgroup(const char* proc_cgroups, const char* proc_self_cgroup, const char* proc_self_mountinfo, u1* cg_flags);
+-#endif
+ };
+ 
+ #endif // SHARE_PRIMS_WHITEBOX_HPP
+diff --git a/test/hotspot/jtreg/containers/cgroup/CgroupSubsystemFactory.java b/test/hotspot/jtreg/containers/cgroup/CgroupSubsystemFactory.java
+deleted file mode 100644
+index b5128c646..000000000
+--- a/test/hotspot/jtreg/containers/cgroup/CgroupSubsystemFactory.java
++++ /dev/null
+@@ -1,253 +0,0 @@
+-/*
+- * Copyright (c) 2020, Red Hat Inc.
+- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+- *
+- * This code is free software; you can redistribute it and/or modify it
+- * under the terms of the GNU General Public License version 2 only, as
+- * published by the Free Software Foundation.
+- *
+- * This code is distributed in the hope that it will be useful, but WITHOUT
+- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+- * version 2 for more details (a copy is included in the LICENSE file that
+- * accompanied this code).
+- *
+- * You should have received a copy of the GNU General Public License version
+- * 2 along with this work; if not, write to the Free Software Foundation,
+- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+- *
+- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+- * or visit www.oracle.com if you need additional information or have any
+- * questions.
+- */
+-
+-/*
+- * @test CgroupSubsystemFactory
+- * @requires os.family == "linux"
+- * @library /testlibrary /test/lib
+- * @build sun.hotspot.WhiteBox
+- * @run driver ClassFileInstaller sun.hotspot.WhiteBox
+- * @run main/othervm -Xbootclasspath/a:. -XX:+UnlockDiagnosticVMOptions -XX:+WhiteBoxAPI CgroupSubsystemFactory
+- */
+-
+-import java.io.IOException;
+-import java.nio.charset.StandardCharsets;
+-import java.nio.file.Files;
+-import java.nio.file.Path;
+-import java.nio.file.Paths;
+-
+-import jdk.test.lib.Asserts;
+-import jdk.test.lib.Utils;
+-import jdk.test.lib.util.FileUtils;
+-import sun.hotspot.WhiteBox;
+-
+-/*
+- * Verify hotspot's detection heuristics of CgroupSubsystemFactory::create()
+- */
+-public class CgroupSubsystemFactory {
+-
+-    // Mirrored from src/hotspot/os/linux/cgroupSubsystem_linux.hpp
+-    private static final int CGROUPS_V1 = 1;
+-    private static final int CGROUPS_V2 = 2;
+-    private static final int INVALID_CGROUPS_V2 = 3;
+-    private static final int INVALID_CGROUPS_V1 = 4;
+-    private static final int INVALID_CGROUPS_NO_MOUNT = 5;
+-    private Path existingDirectory;
+-    private Path cgroupv1CgInfoZeroHierarchy;
+-    private Path cgroupv1MntInfoZeroHierarchy;
+-    private Path cgroupv2CgInfoZeroHierarchy;
+-    private Path cgroupv2MntInfoZeroHierarchy;
+-    private Path cgroupv1CgInfoNonZeroHierarchy;
+-    private Path cgroupv1MntInfoNonZeroHierarchyOtherOrder;
+-    private Path cgroupv1MntInfoNonZeroHierarchy;
+-    private String mntInfoEmpty = "";
+-    private Path cgroupV1SelfCgroup;
+-    private Path cgroupV2SelfCgroup;
+-    private Path cgroupV2MntInfoMissingCgroupv2;
+-    private Path cgroupv1MntInfoMissingMemoryController;
+-    private String procSelfCgroupHybridContent = "11:hugetlb:/\n" +
+-            "10:devices:/user.slice\n" +
+-            "9:pids:/user.slice/user-15263.slice/user@15263.service\n" +
+-            "8:cpu,cpuacct:/\n" +
+-            "7:perf_event:/\n" +
+-            "6:freezer:/\n" +
+-            "5:blkio:/\n" +
+-            "4:net_cls,net_prio:/\n" +
+-            "3:cpuset:/\n" +
+-            "2:memory:/user.slice/user-15263.slice/user@15263.service\n" +
+-            "1:name=systemd:/user.slice/user-15263.slice/user@15263.service/gnome-terminal-server.service\n" +
+-            "0::/user.slice/user-15263.slice/user@15263.service/gnome-terminal-server.service";
+-    private String procSelfCgroupV2UnifiedContent = "0::/user.slice/user-1000.slice/session-3.scope";
+-    private String cgroupsZeroHierarchy =
+-            "#subsys_name hierarchy num_cgroups enabled\n" +
+-            "cpuset 0 1 1\n" +
+-            "cpu 0 1 1\n" +
+-            "cpuacct 0 1 1\n" +
+-            "memory 0 1 1\n" +
+-            "devices 0 1 1\n" +
+-            "freezer 0 1 1\n" +
+-            "net_cls 0 1 1\n" +
+-            "blkio 0 1 1\n" +
+-            "perf_event 0 1 1 ";
+-    private String cgroupV2LineHybrid = "31 30 0:27 / /sys/fs/cgroup/unified rw,nosuid,nodev,noexec,relatime shared:5 - cgroup2 cgroup2 rw,seclabel,nsdelegate\n";
+-    private String cgroupv1MountInfoLineMemory = "35 30 0:31 / /sys/fs/cgroup/memory rw,nosuid,nodev,noexec,relatime shared:7 - cgroup cgroup rw,seclabel,memory\n";
+-    private String mntInfoHybridStub =
+-            "30 23 0:26 / /sys/fs/cgroup ro,nosuid,nodev,noexec shared:4 - tmpfs tmpfs ro,seclabel,mode=755\n" +
+-            "32 30 0:28 / /sys/fs/cgroup/systemd rw,nosuid,nodev,noexec,relatime shared:6 - cgroup cgroup rw,seclabel,xattr,name=systemd\n" +
+-            "36 30 0:32 / /sys/fs/cgroup/pids rw,nosuid,nodev,noexec,relatime shared:8 - cgroup cgroup rw,seclabel,pids\n" +
+-            "37 30 0:33 / /sys/fs/cgroup/perf_event rw,nosuid,nodev,noexec,relatime shared:9 - cgroup cgroup rw,seclabel,perf_event\n" +
+-            "38 30 0:34 / /sys/fs/cgroup/net_cls,net_prio rw,nosuid,nodev,noexec,relatime shared:10 - cgroup cgroup rw,seclabel,net_cls,net_prio\n" +
+-            "39 30 0:35 / /sys/fs/cgroup/hugetlb rw,nosuid,nodev,noexec,relatime shared:11 - cgroup cgroup rw,seclabel,hugetlb\n" +
+-            "40 30 0:36 / /sys/fs/cgroup/cpu,cpuacct rw,nosuid,nodev,noexec,relatime shared:12 - cgroup cgroup rw,seclabel,cpu,cpuacct\n" +
+-            "41 30 0:37 / /sys/fs/cgroup/devices rw,nosuid,nodev,noexec,relatime shared:13 - cgroup cgroup rw,seclabel,devices\n" +
+-            "42 30 0:38 / /sys/fs/cgroup/cpuset rw,nosuid,nodev,noexec,relatime shared:14 - cgroup cgroup rw,seclabel,cpuset\n" +
+-            "43 30 0:39 / /sys/fs/cgroup/blkio rw,nosuid,nodev,noexec,relatime shared:15 - cgroup cgroup rw,seclabel,blkio\n" +
+-            "44 30 0:40 / /sys/fs/cgroup/freezer rw,nosuid,nodev,noexec,relatime shared:16 - cgroup cgroup rw,seclabel,freezer";
+-    private String mntInfoHybridRest = cgroupv1MountInfoLineMemory + mntInfoHybridStub;
+-    private String mntInfoHybridMissingMemory = mntInfoHybridStub;
+-    private String mntInfoHybrid = cgroupV2LineHybrid + mntInfoHybridRest;
+-    private String mntInfoHybridFlippedOrder = mntInfoHybridRest + cgroupV2LineHybrid;
+-    private String cgroupsNonZeroHierarchy =
+-            "#subsys_name hierarchy   num_cgroups enabled\n" +
+-            "cpuset  3   1   1\n" +
+-            "cpu 8   1   1\n" +
+-            "cpuacct 8   1   1\n" +
+-            "blkio   10  1   1\n" +
+-            "memory  2   90  1\n" +
+-            "devices 8   74  1\n" +
+-            "freezer 11  1   1\n" +
+-            "net_cls 5   1   1\n" +
+-            "perf_event  4   1   1\n" +
+-            "net_prio    5   1   1\n" +
+-            "hugetlb 6   1   1\n" +
+-            "pids    3   80  1";
+-    private String mntInfoCgroupsV2Only =
+-            "28 21 0:25 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:4 - cgroup2 cgroup2 rw,seclabel,nsdelegate";
+-
+-    private void setup() {
+-        try {
+-            existingDirectory = Utils.createTempDirectory(CgroupSubsystemFactory.class.getSimpleName());
+-            Path cgroupsZero = Paths.get(existingDirectory.toString(), "cgroups_zero");
+-            Files.writeString(cgroupsZero, cgroupsZeroHierarchy, StandardCharsets.UTF_8);
+-            cgroupv1CgInfoZeroHierarchy = cgroupsZero;
+-            cgroupv2CgInfoZeroHierarchy = cgroupsZero;
+-            cgroupv1MntInfoZeroHierarchy = Paths.get(existingDirectory.toString(), "mountinfo_empty");
+-            Files.writeString(cgroupv1MntInfoZeroHierarchy, mntInfoEmpty);
+-
+-            cgroupv2MntInfoZeroHierarchy = Paths.get(existingDirectory.toString(), "mountinfo_cgroupv2");
+-            Files.writeString(cgroupv2MntInfoZeroHierarchy, mntInfoCgroupsV2Only);
+-
+-            cgroupv1CgInfoNonZeroHierarchy = Paths.get(existingDirectory.toString(), "cgroups_non_zero");
+-            Files.writeString(cgroupv1CgInfoNonZeroHierarchy, cgroupsNonZeroHierarchy);
+-
+-            cgroupv1MntInfoNonZeroHierarchy = Paths.get(existingDirectory.toString(), "mountinfo_non_zero");
+-            Files.writeString(cgroupv1MntInfoNonZeroHierarchy, mntInfoHybrid);
+-
+-            cgroupv1MntInfoNonZeroHierarchyOtherOrder = Paths.get(existingDirectory.toString(), "mountinfo_non_zero_cgroupv2_last");
+-            Files.writeString(cgroupv1MntInfoNonZeroHierarchyOtherOrder, mntInfoHybridFlippedOrder);
+-
+-            cgroupV1SelfCgroup = Paths.get(existingDirectory.toString(), "cgroup_self_hybrid");
+-            Files.writeString(cgroupV1SelfCgroup, procSelfCgroupHybridContent);
+-
+-            cgroupV2SelfCgroup = Paths.get(existingDirectory.toString(), "cgroup_self_v2");
+-            Files.writeString(cgroupV2SelfCgroup, procSelfCgroupV2UnifiedContent);
+-
+-            cgroupv1MntInfoMissingMemoryController = Paths.get(existingDirectory.toString(), "mnt_info_missing_memory");
+-            Files.writeString(cgroupv1MntInfoMissingMemoryController, mntInfoHybridMissingMemory);
+-
+-            cgroupV2MntInfoMissingCgroupv2 = Paths.get(existingDirectory.toString(), "mnt_info_missing_cgroup2");
+-            Files.writeString(cgroupV2MntInfoMissingCgroupv2, mntInfoHybridStub);
+-        } catch (IOException e) {
+-            throw new RuntimeException(e);
+-        }
+-    }
+-
+-    private void teardown() {
+-        try {
+-            FileUtils.deleteFileTreeWithRetry(existingDirectory);
+-        } catch (IOException e) {
+-            System.err.println("Teardown failed. " + e.getMessage());
+-        }
+-    }
+-
+-    private boolean isValidCgroup(int value) {
+-        return value == CGROUPS_V1 || value == CGROUPS_V2;
+-    }
+-
+-    public void testCgroupv1NoMounts(WhiteBox wb) {
+-        String procCgroups = cgroupv1CgInfoZeroHierarchy.toString();
+-        String procSelfCgroup = cgroupV1SelfCgroup.toString();
+-        String procSelfMountinfo = cgroupv1MntInfoZeroHierarchy.toString();
+-        int retval = wb.validateCgroup(procCgroups, procSelfCgroup, procSelfMountinfo);
+-        Asserts.assertEQ(INVALID_CGROUPS_NO_MOUNT, retval, "No cgroups mounted in /proc/self/mountinfo. Invalid.");
+-        Asserts.assertFalse(isValidCgroup(retval));
+-        System.out.println("testCgroupv1NoMounts PASSED!");
+-    }
+-
+-    public void testCgroupv2NoCgroup2Fs(WhiteBox wb) {
+-        String procCgroups = cgroupv2CgInfoZeroHierarchy.toString();
+-        String procSelfCgroup = cgroupV2SelfCgroup.toString();
+-        String procSelfMountinfo = cgroupV2MntInfoMissingCgroupv2.toString();
+-        int retval = wb.validateCgroup(procCgroups, procSelfCgroup, procSelfMountinfo);
+-        Asserts.assertEQ(INVALID_CGROUPS_V2, retval, "No cgroup2 filesystem in /proc/self/mountinfo. Invalid.");
+-        Asserts.assertFalse(isValidCgroup(retval));
+-        System.out.println("testCgroupv2NoCgroup2Fs PASSED!");
+-    }
+-
+-    public void testCgroupv1MissingMemoryController(WhiteBox wb) {
+-        String procCgroups = cgroupv1CgInfoNonZeroHierarchy.toString();
+-        String procSelfCgroup = cgroupV1SelfCgroup.toString();
+-        String procSelfMountinfo = cgroupv1MntInfoMissingMemoryController.toString();
+-        int retval = wb.validateCgroup(procCgroups, procSelfCgroup, procSelfMountinfo);
+-        Asserts.assertEQ(INVALID_CGROUPS_V1, retval, "Required memory controller path missing in mountinfo. Invalid.");
+-        Asserts.assertFalse(isValidCgroup(retval));
+-        System.out.println("testCgroupv1MissingMemoryController PASSED!");
+-    }
+-
+-    public void testCgroupv2(WhiteBox wb) {
+-        String procCgroups = cgroupv2CgInfoZeroHierarchy.toString();
+-        String procSelfCgroup = cgroupV2SelfCgroup.toString();
+-        String procSelfMountinfo = cgroupv2MntInfoZeroHierarchy.toString();
+-        int retval = wb.validateCgroup(procCgroups, procSelfCgroup, procSelfMountinfo);
+-        Asserts.assertEQ(CGROUPS_V2, retval, "Expected");
+-        Asserts.assertTrue(isValidCgroup(retval));
+-        System.out.println("testCgroupv2 PASSED!");
+-    }
+-
+-    public void testCgroupV1Hybrid(WhiteBox wb) {
+-        String procCgroups = cgroupv1CgInfoNonZeroHierarchy.toString();
+-        String procSelfCgroup = cgroupV1SelfCgroup.toString();
+-        String procSelfMountinfo = cgroupv1MntInfoNonZeroHierarchy.toString();
+-        int retval = wb.validateCgroup(procCgroups, procSelfCgroup, procSelfMountinfo);
+-        Asserts.assertEQ(CGROUPS_V1, retval, "Hybrid cgroups expected as cgroups v1");
+-        Asserts.assertTrue(isValidCgroup(retval));
+-        System.out.println("testCgroupv1Hybrid PASSED!");
+-    }
+-
+-    public void testCgroupV1HybridMntInfoOrder(WhiteBox wb) {
+-        String procCgroups = cgroupv1CgInfoNonZeroHierarchy.toString();
+-        String procSelfCgroup = cgroupV1SelfCgroup.toString();
+-        String procSelfMountinfo = cgroupv1MntInfoNonZeroHierarchyOtherOrder.toString();
+-        int retval = wb.validateCgroup(procCgroups, procSelfCgroup, procSelfMountinfo);
+-        Asserts.assertEQ(CGROUPS_V1, retval, "Hybrid cgroups expected as cgroups v1");
+-        Asserts.assertTrue(isValidCgroup(retval));
+-        System.out.println("testCgroupv1HybridMntInfoOrder PASSED!");
+-    }
+-
+-
+-    public static void main(String[] args) throws Exception {
+-        WhiteBox wb = WhiteBox.getWhiteBox();
+-        CgroupSubsystemFactory test = new CgroupSubsystemFactory();
+-        test.setup();
+-        try {
+-            test.testCgroupv1NoMounts(wb);
+-            test.testCgroupv2(wb);
+-            test.testCgroupV1Hybrid(wb);
+-            test.testCgroupV1HybridMntInfoOrder(wb);
+-            test.testCgroupv1MissingMemoryController(wb);
+-            test.testCgroupv2NoCgroup2Fs(wb);
+-        } finally {
+-            test.teardown();
+-        }
+-    }
+-}
+diff --git a/test/hotspot/jtreg/containers/docker/TestCPUAwareness.java b/test/hotspot/jtreg/containers/docker/TestCPUAwareness.java
+index f2264d6f5..149e81ada 100644
+--- a/test/hotspot/jtreg/containers/docker/TestCPUAwareness.java
++++ b/test/hotspot/jtreg/containers/docker/TestCPUAwareness.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2017, 2020, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2017, 2019, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -34,7 +34,6 @@
+  * @run driver TestCPUAwareness
+  */
+ import java.util.List;
+-import jdk.test.lib.process.OutputAnalyzer;
+ import jdk.test.lib.containers.docker.Common;
+ import jdk.test.lib.containers.docker.DockerRunOptions;
+ import jdk.test.lib.containers.docker.DockerTestUtils;
+@@ -214,21 +213,9 @@ public class TestCPUAwareness {
+ 
+         DockerRunOptions opts = Common.newOpts(imageName)
+             .addDockerOpts("--cpu-shares=" + shares);
+-        OutputAnalyzer out = Common.run(opts);
+-        // Cgroups v2 needs to do some scaling of raw shares values. Hence,
+-        // 256 CPU shares come back as 264. Raw value written to cpu.weight
+-        // is 10. The reason this works for >= 1024 shares value is because
+-        // post-scaling the closest multiple of 1024 is found and returned.
+-        //
+-        // For values < 1024, this doesn't happen so loosen the match to a
+-        // 3-digit number and ensure the active_processor_count is as
+-        // expected.
+-        if (shares < 1024) {
+-            out.shouldMatch("CPU Shares is.*\\d{3}");
+-        } else {
+-            out.shouldMatch("CPU Shares is.*" + shares);
+-        }
+-        out.shouldMatch("active_processor_count.*" + expectedAPC);
++        Common.run(opts)
++            .shouldMatch("CPU Shares is.*" + shares)
++            .shouldMatch("active_processor_count.*" + expectedAPC);
+     }
+ 
+     private static void testOperatingSystemMXBeanAwareness(String cpuAllocation, String expectedCpus) throws Exception {
+diff --git a/test/lib/sun/hotspot/WhiteBox.java b/test/lib/sun/hotspot/WhiteBox.java
+index 67235798b..2a1ddeaba 100644
+--- a/test/lib/sun/hotspot/WhiteBox.java
++++ b/test/lib/sun/hotspot/WhiteBox.java
+@@ -595,9 +595,6 @@ public class WhiteBox {
+ 
+   // Container testing
+   public native boolean isContainerized();
+-  public native int validateCgroup(String procCgroups,
+-                                   String procSelfCgroup,
+-                                   String procSelfMountinfo);
+   public native void printOsInfo();
+ 
+   // Decoder
+-- 
+2.28.0
+

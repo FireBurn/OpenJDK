@@ -1,0 +1,26 @@
+--- old/jdk15u-jdk-15.0.1+9/src/jdk.incubator.jpackage/share/native/common/tstrings.cpp	2020-09-11 17:12:45.000000000 +0100
++++ jdk15u-jdk-15.0.1+9/src/jdk.incubator.jpackage/share/native/common/tstrings.cpp	2020-10-23 09:26:31.163895838 +0100
+@@ -53,13 +53,10 @@
+         ret = _vsntprintf_s(&*fmtout.begin(), fmtout.size(), _TRUNCATE, format, args);
+ #else
+ #ifdef __GNUC__
+-#pragma GCC diagnostic push
+-#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+ #endif
+         // With g++ this compiles only with '-std=gnu++0x' option
+         ret = vsnprintf(&*fmtout.begin(), fmtout.size(), format, args);
+ #ifdef __GNUC__
+-#pragma GCC diagnostic pop
+ #endif
+ #endif
+     } while(-1 == ret);
+--- old/jdk15u-jdk-15.0.1+9/src/jdk.incubator.jpackage/share/native/applauncher/AppLauncher.cpp	2020-09-11 17:12:45.000000000 +0100
++++ jdk15u-jdk-15.0.1+9/src/jdk.incubator.jpackage/share/native/applauncher/AppLauncher.cpp	2020-10-23 09:16:13.862498452 +0100
+@@ -221,7 +221,6 @@
+     }
+     std::unique_ptr<WithExtraLogAppender> withLogAppender;
+     std::string errorMsg;
+-    const ResetLastErrorMsgAtEndOfScope resetLastErrorMsg;
+ 
+     JP_TRY;
+ 

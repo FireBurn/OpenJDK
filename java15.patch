@@ -1,0 +1,102 @@
+diff --git a/make/autoconf/toolchain.m4 b/make/autoconf/toolchain.m4
+index a51757cb2..f48409956 100644
+--- a/make/autoconf/toolchain.m4
++++ b/make/autoconf/toolchain.m4
+@@ -51,7 +51,7 @@ TOOLCHAIN_DESCRIPTION_xlc="IBM XL C/C++"
+ 
+ # Minimum supported versions, empty means unspecified
+ TOOLCHAIN_MINIMUM_VERSION_clang="3.2"
+-TOOLCHAIN_MINIMUM_VERSION_gcc="5.0"
++TOOLCHAIN_MINIMUM_VERSION_gcc="4.8"
+ TOOLCHAIN_MINIMUM_VERSION_microsoft="16.00.30319.01" # VS2010
+ TOOLCHAIN_MINIMUM_VERSION_xlc=""
+ 
+diff --git a/src/hotspot/share/memory/operator_new.cpp b/src/hotspot/share/memory/operator_new.cpp
+index 84a4152b7..bf4dcc558 100644
+--- a/src/hotspot/share/memory/operator_new.cpp
++++ b/src/hotspot/share/memory/operator_new.cpp
+@@ -91,7 +91,9 @@ void operator delete [](void* p) throw() {
+ 
+ #ifdef __GNUG__
+ // Warning disabled for gcc 5.4
++// Warning for unknown warning disabled for gcc 4.8.5
+ PRAGMA_DIAG_PUSH
++PRAGMA_DISABLE_GCC_WARNING("-Wpragmas")
+ PRAGMA_DISABLE_GCC_WARNING("-Wc++14-compat")
+ #endif // __GNUG__
+ 
+diff --git a/src/hotspot/share/utilities/compilerWarnings_gcc.hpp b/src/hotspot/share/utilities/compilerWarnings_gcc.hpp
+index 27ea42691..4f0d8b969 100644
+--- a/src/hotspot/share/utilities/compilerWarnings_gcc.hpp
++++ b/src/hotspot/share/utilities/compilerWarnings_gcc.hpp
+@@ -27,12 +27,18 @@
+ 
+ // Macros related to control of compiler warnings.
+ 
++// Diagnostic pragmas like the ones defined below in PRAGMA_FORMAT_NONLITERAL_IGNORED
++// were only introduced in GCC 4.2. Because we have no other possibility to ignore
++// these warnings for older versions of GCC, we simply don't decorate our printf-style
++// functions with __attribute__(format) in that case.
++#if ((__GNUC__ == 4) && (__GNUC_MINOR__ >= 2)) || (__GNUC__ > 4)
+ #ifndef ATTRIBUTE_PRINTF
+ #define ATTRIBUTE_PRINTF(fmt,vargs)  __attribute__((format(printf, fmt, vargs)))
+ #endif
+ #ifndef ATTRIBUTE_SCANF
+ #define ATTRIBUTE_SCANF(fmt,vargs)  __attribute__((format(scanf, fmt, vargs)))
+ #endif
++#endif // gcc version check
+ 
+ #define PRAGMA_DISABLE_GCC_WARNING_AUX(x) _Pragma(#x)
+ #define PRAGMA_DISABLE_GCC_WARNING(option_string) \
+diff --git a/src/hotspot/share/utilities/debug.hpp b/src/hotspot/share/utilities/debug.hpp
+index 6b5b0f634..65a618a66 100644
+--- a/src/hotspot/share/utilities/debug.hpp
++++ b/src/hotspot/share/utilities/debug.hpp
+@@ -154,8 +154,15 @@ enum VMErrorType {
+ 
+ // error reporting helper functions
+ void report_vm_error(const char* file, int line, const char* error_msg);
++#if !defined(__GNUC__) || defined (__clang_major__) || (((__GNUC__ == 4) && (__GNUC_MINOR__ >= 8)) || __GNUC__ > 4)
++// ATTRIBUTE_PRINTF works with gcc >= 4.8 and any other compiler.
+ void report_vm_error(const char* file, int line, const char* error_msg,
+                      const char* detail_fmt, ...) ATTRIBUTE_PRINTF(4, 5);
++#else
++// GCC < 4.8 warns because of empty format string.  Warning can not be switched off selectively.
++void report_vm_error(const char* file, int line, const char* error_msg,
++                     const char* detail_fmt, ...);
++#endif
+ void report_vm_status_error(const char* file, int line, const char* error_msg,
+                             int status, const char* detail);
+ void report_fatal(const char* file, int line, const char* detail_fmt, ...) ATTRIBUTE_PRINTF(3, 4);
+diff --git a/src/hotspot/share/utilities/globalDefinitions_gcc.hpp b/src/hotspot/share/utilities/globalDefinitions_gcc.hpp
+index 2ae2ad325..0e9a396f7 100644
+--- a/src/hotspot/share/utilities/globalDefinitions_gcc.hpp
++++ b/src/hotspot/share/utilities/globalDefinitions_gcc.hpp
+@@ -118,7 +118,10 @@ inline int g_isnan(double f) { return isnan(f); }
+ #error "missing platform-specific definition here"
+ #endif
+ 
++// GCC 4.3 does not allow 0.0/0.0 to produce a NAN value
++#if (__GNUC__ == 4) && (__GNUC_MINOR__ > 2)
+ #define CAN_USE_NAN_DEFINE 1
++#endif
+ 
+ 
+ // Checking for finiteness
+@@ -162,6 +165,15 @@ inline int wcslen(const jchar* x) { return wcslen((const wchar_t*)x); }
+ 
+ // Alignment
+ //
+-#define ATTRIBUTE_ALIGNED(x) __attribute__((aligned(x)))
++// NOTE! The "+0" below is a workaround for a known bug in older GCC versions
++// (known to fail with 4.6.0, fixed in 4.9.0). This bug affects systems such as
++// RedHat/Oracle Linux 7.5, which ships with GCC 4.8.5. For more details, see
++// https://gcc.gnu.org/bugzilla/show_bug.cgi?id=55382 and
++// https://gcc.gnu.org/bugzilla/show_bug.cgi?id=53017
++//
++// GCC versions older than 4.6.4 would fail even with "+0", and needs additional
++// cast to __typeof__(x) to work around the similar bug.
++//
++#define ATTRIBUTE_ALIGNED(x) __attribute__((aligned((__typeof__(x))x+0)))
+ 
+ #endif // SHARE_UTILITIES_GLOBALDEFINITIONS_GCC_HPP

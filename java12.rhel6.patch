@@ -1,0 +1,69 @@
+diff --git a/src/java.desktop/share/native/libfontmanager/harfbuzz/hb-dsalgs.hh b/src/java.desktop/share/native/libfontmanager/harfbuzz/hb-dsalgs.hh
+index f5f286883..c0af39abe 100644
+--- a/src/java.desktop/share/native/libfontmanager/harfbuzz/hb-dsalgs.hh
++++ b/src/java.desktop/share/native/libfontmanager/harfbuzz/hb-dsalgs.hh
+@@ -233,17 +233,21 @@ hb_ctz (T v)
+  * Tiny stuff.
+  */
+ 
++#if defined(__GNUC__) && __GNUC__ >= 5
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wcast-align"
++#endif
+ template <typename T>
+ static inline T* hb_addressof (T& arg)
+ {
+-#pragma GCC diagnostic push
+-#pragma GCC diagnostic ignored "-Wcast-align"
+   /* https://en.cppreference.com/w/cpp/memory/addressof */
+   return reinterpret_cast<T*>(
+            &const_cast<char&>(
+               reinterpret_cast<const volatile char&>(arg)));
+-#pragma GCC diagnostic pop
+ }
++#if defined(__GNUC__) && __GNUC__ >= 5
++#pragma GCC diagnostic pop
++#endif
+ 
+ /* ASCII tag/character handling */
+ static inline bool ISALPHA (unsigned char c)
+diff --git a/src/java.desktop/share/native/libfontmanager/harfbuzz/hb-machinery.hh b/src/java.desktop/share/native/libfontmanager/harfbuzz/hb-machinery.hh
+index 2ae288494..3c9053338 100644
+--- a/src/java.desktop/share/native/libfontmanager/harfbuzz/hb-machinery.hh
++++ b/src/java.desktop/share/native/libfontmanager/harfbuzz/hb-machinery.hh
+@@ -65,21 +65,29 @@ template<typename Type>
+ static inline Type& StructAtOffset(void *P, unsigned int offset)
+ { return * reinterpret_cast<Type*> ((char *) P + offset); }
+ template<typename Type>
+-static inline const Type& StructAtOffsetUnaligned(const void *P, unsigned int offset)
+-{
++#if defined(__GNUC__) && __GNUC__ >= 5
+ #pragma GCC diagnostic push
+ #pragma GCC diagnostic ignored "-Wcast-align"
++#endif
++static inline const Type& StructAtOffsetUnaligned(const void *P, unsigned int offset)
++{
+   return * reinterpret_cast<Type*> ((char *) P + offset);
+-#pragma GCC diagnostic pop
+ }
++#if defined(__GNUC__) && __GNUC__ >= 5
++#pragma GCC diagnostic pop
++#endif
+ template<typename Type>
+-static inline Type& StructAtOffsetUnaligned(void *P, unsigned int offset)
+-{
++#if defined(__GNUC__) && __GNUC__ >= 5
+ #pragma GCC diagnostic push
+ #pragma GCC diagnostic ignored "-Wcast-align"
++#endif
++static inline Type& StructAtOffsetUnaligned(void *P, unsigned int offset)
++{
+   return * reinterpret_cast<Type*> ((char *) P + offset);
+-#pragma GCC diagnostic pop
+ }
++#if defined(__GNUC__) && __GNUC__ >= 5
++#pragma GCC diagnostic pop
++#endif
+ 
+ /* StructAfter<T>(X) returns the struct T& that is placed after X.
+  * Works with X of variable size also.  X must implement get_size() */

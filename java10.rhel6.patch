@@ -1,0 +1,35 @@
+diff --git a/src/hotspot/os/linux/os_linux.inline.hpp b/src/hotspot/os/linux/os_linux.inline.hpp
+index cf00c6a46..ed9de8c41 100644
+--- a/src/hotspot/os/linux/os_linux.inline.hpp
++++ b/src/hotspot/os/linux/os_linux.inline.hpp
+@@ -96,13 +96,14 @@ inline int os::ftruncate(int fd, jlong length) {
+   return ::ftruncate64(fd, length);
+ }
+ 
++#if defined(__GNUC__) && __GNUC__ >= 5
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
++#endif
+ inline struct dirent* os::readdir(DIR* dirp, dirent *dbuf)
+ {
+ // readdir_r has been deprecated since glibc 2.24.
+ // See https://sourceware.org/bugzilla/show_bug.cgi?id=19056 for more details.
+-#pragma GCC diagnostic push
+-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+-
+   dirent* p;
+   int status;
+   assert(dirp != NULL, "just checking");
+@@ -116,9 +117,10 @@ inline struct dirent* os::readdir(DIR* dirp, dirent *dbuf)
+     return NULL;
+   } else
+     return p;
+-
+-#pragma GCC diagnostic pop
+ }
++#if defined(__GNUC__) && __GNUC__ >= 5
++#pragma GCC diagnostic pop
++#endif
+ 
+ inline int os::closedir(DIR *dirp) {
+   assert(dirp != NULL, "argument is NULL");

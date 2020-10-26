@@ -1,0 +1,16 @@
+diff --git a/src/hotspot/share/prims/jvmtiRawMonitor.hpp b/src/hotspot/share/prims/jvmtiRawMonitor.hpp
+index dbf6bca9a..897647e99 100644
+--- a/src/hotspot/share/prims/jvmtiRawMonitor.hpp
++++ b/src/hotspot/share/prims/jvmtiRawMonitor.hpp
+@@ -84,11 +84,6 @@ class JvmtiRawMonitor : public CHeapObj<mtSynchronizer>  {
+     M_INTERRUPTED            // Thread.interrupt()
+   };
+ 
+-  // Non-aborting operator new
+-  void* operator new(size_t size) throw() {
+-    return CHeapObj::operator new(size, std::nothrow);
+-  }
+-
+   JvmtiRawMonitor(const char* name);
+   ~JvmtiRawMonitor();
+ 
